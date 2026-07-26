@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ark::client::init_io;
+use ark::client::init;
 use ark::context::{create_client_context, create_server_context};
 use ark::server::serve;
 use ark::types::IdentityContext;
@@ -45,7 +45,7 @@ fn init_account(root: &Path, subdir: &str, port: u16, name: &str) -> IdentityCon
     let dir = root.join(subdir);
     fs::create_dir_all(&dir).unwrap();
     env::set_current_dir(&dir).unwrap();
-    init_io(&format!("{}@127.0.0.1:{}", name, port), None).unwrap();
+    init(&dir, &format!("{}@127.0.0.1:{}", name, port), None, false).unwrap();
     create_client_context().unwrap()
 }
 

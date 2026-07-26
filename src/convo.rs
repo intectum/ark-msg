@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use ark::client::{chmod_io, put_io, track_io};
+use ark::client::chmod;
 use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
 use ark::types::{IdentityContext, Permission};
 use serde::{Deserialize, Serialize};
@@ -38,26 +38,12 @@ pub fn create(
 
     let local_dir = ctx.root.join(&rel);
     fs::create_dir_all(&local_dir)?;
-    track_io(ctx, local_dir.to_str().unwrap(), None)?;
-
-    if !members.is_empty() {
-        chmod_io(ctx, local_dir.to_str().unwrap(), &[], members, &[], &[])?;
-    }
-    put_io(ctx, &format!("/{}/", rel), local_dir.to_str(), None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &[], members, &[], &[], false, None)?;
 
     let doc = ConversationDoc { title: title.to_string() };
     let json_path = local_dir.join(CONVERSATION_JSON);
-    let json_target = format!("/{}/{}", rel, CONVERSATION_JSON);
     fs::write(&json_path, serde_json::to_vec_pretty(&doc)?)?;
-    track_io(ctx, json_path.to_str().unwrap(), None)?;
-    // TODO: double-put — ark_friction.md#4. chmod on encrypted file needs an
-    // existing file_key, only put mints one. Collapse when ark supports
-    // chmod-mints-key or put_with_members.
-    put_io(ctx, &json_target, json_path.to_str(), None)?;
-    if !members.is_empty() {
-        chmod_io(ctx, json_path.to_str().unwrap(), &[], &[], members, &[])?;
-        put_io(ctx, &json_target, json_path.to_str(), None)?;
-    }
+    chmod(ctx, json_path.to_str().unwrap(), &[], &[], members, &[], false, None)?;
 
     Ok(dir_name)
 }
@@ -112,13 +98,11 @@ pub fn resolve(ctx: &IdentityContext, arg: &str) -> io::Result<String> {
 pub fn add_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
     let local_dir = ctx.root.join(&rel);
-    chmod_io(ctx, local_dir.to_str().unwrap(), &[], &[addr.to_string()], &[], &[])?;
-    put_io(ctx, &format!("/{}/", rel), local_dir.to_str(), None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &[], &[addr.to_string()], &[], &[], false, None)?;
 
     let json_path = local_dir.join(CONVERSATION_JSON);
     if json_path.exists() {
-        chmod_io(ctx, json_path.to_str().unwrap(), &[], &[], &[addr.to_string()], &[])?;
-        put_io(ctx, &format!("/{}/{}", rel, CONVERSATION_JSON), json_path.to_str(), None)?;
+        chmod(ctx, json_path.to_str().unwrap(), &[], &[], &[addr.to_string()], &[], false, None)?;
     }
     Ok(())
 }
@@ -126,13 +110,11 @@ pub fn add_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Resu
 pub fn remove_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
     let local_dir = ctx.root.join(&rel);
-    chmod_io(ctx, local_dir.to_str().unwrap(), &[], &[], &[], &[addr.to_string()])?;
-    put_io(ctx, &format!("/{}/", rel), local_dir.to_str(), None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &[], &[], &[], &[addr.to_string()], false, None)?;
 
     let json_path = local_dir.join(CONVERSATION_JSON);
     if json_path.exists() {
-        chmod_io(ctx, json_path.to_str().unwrap(), &[], &[], &[], &[addr.to_string()])?;
-        put_io(ctx, &format!("/{}/{}", rel, CONVERSATION_JSON), json_path.to_str(), None)?;
+        chmod(ctx, json_path.to_str().unwrap(), &[], &[], &[], &[addr.to_string()], false, None)?;
     }
     Ok(())
 }
@@ -140,13 +122,11 @@ pub fn remove_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::R
 pub fn promote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
     let local_dir = ctx.root.join(&rel);
-    chmod_io(ctx, local_dir.to_str().unwrap(), &[addr.to_string()], &[], &[], &[])?;
-    put_io(ctx, &format!("/{}/", rel), local_dir.to_str(), None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &[addr.to_string()], &[], &[], &[], false, None)?;
 
     let json_path = local_dir.join(CONVERSATION_JSON);
     if json_path.exists() {
-        chmod_io(ctx, json_path.to_str().unwrap(), &[addr.to_string()], &[], &[], &[])?;
-        put_io(ctx, &format!("/{}/{}", rel, CONVERSATION_JSON), json_path.to_str(), None)?;
+        chmod(ctx, json_path.to_str().unwrap(), &[addr.to_string()], &[], &[], &[], false, None)?;
     }
     Ok(())
 }
@@ -163,14 +143,12 @@ pub fn demote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<(
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot demote self: no other owner"));
         }
     }
-    chmod_io(ctx, local_dir.to_str().unwrap(), &[], &[addr.to_string()], &[], &[])?;
-    put_io(ctx, &format!("/{}/", rel), local_dir.to_str(), None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &[], &[addr.to_string()], &[], &[], false, None)?;
 
     let json_path = local_dir.join(CONVERSATION_JSON);
     if json_path.exists() {
         // Convo writer = JSON reader (title read-only for non-owners).
-        chmod_io(ctx, json_path.to_str().unwrap(), &[], &[], &[addr.to_string()], &[])?;
-        put_io(ctx, &format!("/{}/{}", rel, CONVERSATION_JSON), json_path.to_str(), None)?;
+        chmod(ctx, json_path.to_str().unwrap(), &[], &[], &[addr.to_string()], &[], false, None)?;
     }
     Ok(())
 }
@@ -201,4 +179,3 @@ fn count_members(dir: &PathBuf) -> io::Result<(usize, usize)> {
         .count();
     Ok((members, owners))
 }
-

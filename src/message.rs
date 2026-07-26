@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 
-use ark::client::{chmod_io, put_io, track_io};
+use ark::client::chmod;
 use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
 use ark::types::IdentityContext;
 use ark::util::now_iso_fs;
@@ -35,17 +35,7 @@ pub fn send(ctx: &IdentityContext, dir_name: &str, body: &[u8]) -> io::Result<St
     let file_name = format!("{}{}{}", MSG_PREFIX, now_iso_fs(), MSG_SUFFIX);
     let file_path = local_dir.join(&file_name);
     fs::write(&file_path, body)?;
-    track_io(ctx, file_path.to_str().unwrap(), None)?;
-
-    let target = format!("/{}/{}", rel, file_name);
-    // TODO: double-put — ark_friction.md#4. chmod on encrypted file needs an
-    // existing file_key, only put mints one. Collapse when ark supports
-    // chmod-mints-key or put_with_members.
-    put_io(ctx, &target, file_path.to_str(), None)?;
-    if !others.is_empty() {
-        chmod_io(ctx, file_path.to_str().unwrap(), &[], &[], &others, &[])?;
-        put_io(ctx, &target, file_path.to_str(), None)?;
-    }
+    chmod(ctx, file_path.to_str().unwrap(), &[], &[], &others, &[], false, None)?;
 
     Ok(file_name)
 }
