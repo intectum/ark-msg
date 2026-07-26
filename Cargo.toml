@@ -15,8 +15,12 @@ path = "src/main.rs"
 [dependencies]
 ark = { path = "../ark" }
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+libc = "0.2"
+ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+time = { version = "0.3", features = ["parsing", "formatting", "macros", "local-offset"] }
 
 [profile.release]
 opt-level = 3

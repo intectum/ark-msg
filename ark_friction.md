@@ -94,6 +94,19 @@ A "building on ark" guide covering the recurring patterns above (sync a subtree,
 
 - `ark/src/server/relay.rs`, `ark/src/client/request.rs`, `ark/src/client/proposals.rs`, `ark/src/client/sync.rs`
 
+## 12. Client uses raw `eprintln!`/`println!` — no logger, no callback
+
+`ark/src/client/{sync,watch,proposals}.rs` write progress and error messages via `eprintln!`/`println!`. Fine for the CLI; hostile to a TUI. `ark-msg-tui` had to `dup2` `/dev/null` onto fd 2 at startup so ratatui's frame wouldn't be corrupted by lines like `pull: apps/msg/convos/...`, `sync failed for X: Y`, `watch remote: ... (reconnecting)`.
+
+Fix suggestions (any one solves it):
+- Route all internal messages through the `log` or `tracing` crate. Apps install their own subscriber (or silence). Zero cost when no subscriber is installed.
+- Add an optional `on_event`/`on_log` callback on the top-level client functions (`sync`, `watch_remote`, `list_proposals`) so apps can capture messages structurally.
+- At minimum: emit to a `Write` supplied by the caller, defaulting to stderr for the CLI.
+
+Related to friction #6 (sync callbacks) — same underlying gap: no observability surface, so apps either eat noise or `dup2` it away.
+
+- `ark/src/client/sync.rs`, `ark/src/client/watch.rs`, `ark/src/client/proposals.rs`
+
 ## Nice-to-haves discovered along the way
 
 - Parent-dir semantics are undocumented. The server actually `create_dir_all`s intermediate paths on both file and dir PUTs (`ark/src/server/put.rs:60,62`), and `authorize` only checks the target's own metadata — no walk-up-tree. So `PUT apps/msg/convos/foo/` works with no `apps/`, `apps/msg/`, `apps/msg/convos/` metadata anywhere. But nothing in README/spec.md says this, so the default app-author guess ("mirror unix mkdir -p, chmod each parent") is wrong and wasteful. Add a spec.md line: "intermediate directories are created without metadata; access checks are per-target, not walked."

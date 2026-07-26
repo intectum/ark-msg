@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use ark::context::create_client_context;
 use ark::types::IdentityContext;
-use ark_msg::{convo, message, sync};
+use ark_msg::{convo, message, reltime, sync, tui};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -57,8 +57,11 @@ fn main() -> ExitCode {
 }
 
 fn run() -> io::Result<()> {
-    let cli = Cli::parse();
     let ctx = create_client_context()?;
+    if std::env::args_os().len() <= 1 {
+        return tui::run(ctx);
+    }
+    let cli = Cli::parse();
     match cli.cmd {
         Cmd::New { title, slug, members } => cmd_new(&ctx, title, slug, members),
         Cmd::List => cmd_list(&ctx),
@@ -115,7 +118,7 @@ fn cmd_read(ctx: &IdentityContext, convo_arg: String, last: Option<usize>) -> io
     let msgs = message::read(ctx, &dir, last)?;
     let mut stdout = io::stdout().lock();
     for (summary, body) in msgs {
-        writeln!(stdout, "[{}] {}", summary.modified, summary.sender)?;
+        writeln!(stdout, "[{}] {}", reltime::relative(&summary.modified), summary.sender)?;
         stdout.write_all(body.as_bytes())?;
         if !body.ends_with('\n') { writeln!(stdout)?; }
         writeln!(stdout)?;

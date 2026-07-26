@@ -1,7 +1,7 @@
 use std::fs;
 use std::io;
 
-use ark::client::{chmod_io, get_io, put_io, track_io};
+use ark::client::{chmod_io, put_io, track_io};
 use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
 use ark::types::IdentityContext;
 use ark::util::now_iso_fs;
@@ -72,11 +72,11 @@ pub fn list(ctx: &IdentityContext, dir_name: &str) -> io::Result<Vec<MessageSumm
     Ok(msgs)
 }
 
-/// Read message bodies as UTF-8 (best-effort). For each message: if the local
-/// file is still encrypted at rest, decrypt it into place via `get_io`.
+/// Read message bodies as UTF-8 (best-effort). Assumes `sync::run` has
+/// already pulled files decrypted (`sync(ctx, ..., decrypt=true)`), so this
+/// is a pure fs read.
 pub fn read(ctx: &IdentityContext, dir_name: &str, last_n: Option<usize>) -> io::Result<Vec<(MessageSummary, String)>> {
-    let rel = convo_rel_path(dir_name);
-    let local_dir = ctx.root.join(&rel);
+    let local_dir = ctx.root.join(convo_rel_path(dir_name));
     let summaries = list(ctx, dir_name)?;
     let take = last_n.unwrap_or(summaries.len());
     let start = summaries.len().saturating_sub(take);
@@ -84,13 +84,6 @@ pub fn read(ctx: &IdentityContext, dir_name: &str, last_n: Option<usize>) -> io:
     let mut out = Vec::new();
     for summary in &summaries[start..] {
         let path = local_dir.join(&summary.file_name);
-        let encrypted_locally = matches!(
-            ark::metadata::read_local_metadata_attributes(&path)?.encrypted,
-            Some(true)
-        );
-        if encrypted_locally {
-            get_io(ctx, &format!("/{}/{}", rel, summary.file_name), path.to_str(), true)?;
-        }
         let body = fs::read_to_string(&path).unwrap_or_else(|_| "<binary>".to_string());
         out.push((MessageSummary {
             file_name: summary.file_name.clone(),
