@@ -1,9 +1,9 @@
 use std::fs;
 use std::io;
 
-use ark::client::chmod;
+use ark::client::put;
 use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
-use ark::types::IdentityContext;
+use ark::types::{IdentityContext, Permissions};
 use ark::util::now_iso_fs;
 
 use crate::convo;
@@ -35,7 +35,8 @@ pub fn send(ctx: &IdentityContext, dir_name: &str, body: &[u8]) -> io::Result<St
     let file_name = format!("{}{}{}", MSG_PREFIX, now_iso_fs(), MSG_SUFFIX);
     let file_path = local_dir.join(&file_name);
     fs::write(&file_path, body)?;
-    chmod(ctx, file_path.to_str().unwrap(), &[], &[], &others, &[], false, None)?;
+    let perms = Permissions { readers: others, ..Default::default() };
+    put(ctx, &format!("/{}/{}", rel, file_name), Some(file_path.to_str().unwrap()), &perms, None, false)?;
 
     Ok(file_name)
 }

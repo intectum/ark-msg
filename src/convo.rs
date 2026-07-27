@@ -2,9 +2,9 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use ark::client::chmod;
-use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
-use ark::types::{IdentityContext, Permission};
+use ark::client::{chmod, put};
+use ark::metadata::{drop, has_metadata_attributes, owner, read_metadata_attributes, reader, writer};
+use ark::types::{IdentityContext, Permission, Permissions};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::{convo_rel_path, convos_root, default_slug, make_dir_name, now_unix_secs, sanitize_slug};
@@ -38,12 +38,14 @@ pub fn create(
 
     let local_dir = ctx.root.join(&rel);
     fs::create_dir_all(&local_dir)?;
-    chmod(ctx, local_dir.to_str().unwrap(), &[], members, &[], &[], false, None)?;
+    let dir_perms = Permissions { writers: members.to_vec(), ..Default::default() };
+    put(ctx, &format!("/{}", rel), Some(local_dir.to_str().unwrap()), &dir_perms, None, false)?;
 
     let doc = ConversationDoc { title: title.to_string() };
     let json_path = local_dir.join(CONVERSATION_JSON);
     fs::write(&json_path, serde_json::to_vec_pretty(&doc)?)?;
-    chmod(ctx, json_path.to_str().unwrap(), &[], &[], members, &[], false, None)?;
+    let json_perms = Permissions { readers: members.to_vec(), ..Default::default() };
+    put(ctx, &format!("/{}/{}", rel, CONVERSATION_JSON), Some(json_path.to_str().unwrap()), &json_perms, None, false)?;
 
     Ok(dir_name)
 }
@@ -98,11 +100,11 @@ pub fn resolve(ctx: &IdentityContext, arg: &str) -> io::Result<String> {
 pub fn add_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
     let local_dir = ctx.root.join(&rel);
-    chmod(ctx, local_dir.to_str().unwrap(), &[], &[addr.to_string()], &[], &[], false, None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &writer(addr), false)?;
 
     let json_path = local_dir.join(CONVERSATION_JSON);
     if json_path.exists() {
-        chmod(ctx, json_path.to_str().unwrap(), &[], &[], &[addr.to_string()], &[], false, None)?;
+        chmod(ctx, json_path.to_str().unwrap(), &reader(addr), false)?;
     }
     Ok(())
 }
@@ -110,11 +112,11 @@ pub fn add_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Resu
 pub fn remove_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
     let local_dir = ctx.root.join(&rel);
-    chmod(ctx, local_dir.to_str().unwrap(), &[], &[], &[], &[addr.to_string()], false, None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &drop(addr), false)?;
 
     let json_path = local_dir.join(CONVERSATION_JSON);
     if json_path.exists() {
-        chmod(ctx, json_path.to_str().unwrap(), &[], &[], &[], &[addr.to_string()], false, None)?;
+        chmod(ctx, json_path.to_str().unwrap(), &drop(addr), false)?;
     }
     Ok(())
 }
@@ -122,11 +124,11 @@ pub fn remove_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::R
 pub fn promote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
     let local_dir = ctx.root.join(&rel);
-    chmod(ctx, local_dir.to_str().unwrap(), &[addr.to_string()], &[], &[], &[], false, None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &owner(addr), false)?;
 
     let json_path = local_dir.join(CONVERSATION_JSON);
     if json_path.exists() {
-        chmod(ctx, json_path.to_str().unwrap(), &[addr.to_string()], &[], &[], &[], false, None)?;
+        chmod(ctx, json_path.to_str().unwrap(), &owner(addr), false)?;
     }
     Ok(())
 }
@@ -143,12 +145,12 @@ pub fn demote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<(
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot demote self: no other owner"));
         }
     }
-    chmod(ctx, local_dir.to_str().unwrap(), &[], &[addr.to_string()], &[], &[], false, None)?;
+    chmod(ctx, local_dir.to_str().unwrap(), &writer(addr), false)?;
 
     let json_path = local_dir.join(CONVERSATION_JSON);
     if json_path.exists() {
         // Convo writer = JSON reader (title read-only for non-owners).
-        chmod(ctx, json_path.to_str().unwrap(), &[], &[], &[addr.to_string()], &[], false, None)?;
+        chmod(ctx, json_path.to_str().unwrap(), &reader(addr), false)?;
     }
     Ok(())
 }
