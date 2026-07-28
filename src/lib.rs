@@ -8,8 +8,8 @@
 //!   member.
 
 pub mod convo;
+pub mod invite;
 pub mod message;
 pub mod paths;
 pub mod reltime;
-pub mod sync;
 pub mod tui;

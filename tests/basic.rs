@@ -6,11 +6,18 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ark::client::init;
+use ark::client::{accept_proposal, init, sync};
 use ark::context::{create_client_context, create_server_context};
 use ark::server::serve;
 use ark::types::IdentityContext;
-use ark_msg::{convo, message, sync};
+use ark_msg::paths::APPS_MSG;
+use ark_msg::{convo, invite, message};
+
+fn sync_msg(ctx: &IdentityContext) {
+    let path = ctx.root.join(APPS_MSG);
+    fs::create_dir_all(&path).unwrap();
+    sync(ctx, &path, false, true, |_| false, |_| false).unwrap();
+}
 
 fn start_test_server(root: PathBuf) -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
@@ -79,19 +86,23 @@ fn end_to_end_two_accounts() {
     wait_for(|| bob_requests.exists() && fs::read_dir(&bob_requests).map(|d| d.count() > 0).unwrap_or(false),
              "proposal to land on bob's server");
 
-    // Bob syncs: auto-accepts the proposal, pulls the convo dir.
+    // Bob lists invites and accepts the convo share.
     env::set_current_dir(root.join("bob")).unwrap();
     let bob = create_client_context().unwrap();
-    let report = sync::run(&bob).unwrap();
-    assert!(report.accepted.len() >= 1, "expected at least one auto-accept, got {:?} skipped={:?} failed={:?}",
-            report.accepted, report.skipped, report.failed);
+    let invites = invite::list(&bob).unwrap();
+    assert!(!invites.is_empty(), "expected at least one pending invite");
+    let convo_invite = invites.iter().find(|i| i.dir_name == dir_name).expect("invite for created convo");
+    accept_proposal(&bob, &convo_invite.proposal_id, false).unwrap();
 
-    // A second sync round pulls conversation.json (its proposal is written by
-    // alice after the dir is created).
+    // Sync so bob pulls conversation.json (its proposal is written by alice
+    // after the dir is created and must also be accepted).
     wait_for(|| {
-        let r = sync::run(&bob).unwrap();
+        sync_msg(&bob);
+        for i in invite::list(&bob).unwrap() {
+            let _ = accept_proposal(&bob, &i.proposal_id, false);
+        }
         let convos = convo::list(&bob).unwrap();
-        !convos.is_empty() && convos[0].dir_name == dir_name && r.failed.is_empty()
+        !convos.is_empty() && convos[0].dir_name == dir_name
     }, "bob to see the convo locally");
 
     let convos = convo::list(&bob).unwrap();
@@ -107,7 +118,7 @@ fn end_to_end_two_accounts() {
     env::set_current_dir(root.join("bob")).unwrap();
     let bob = create_client_context().unwrap();
     wait_for(|| {
-        let _ = sync::run(&bob).unwrap();
+        sync_msg(&bob);
         message::list(&bob, &dir_name).map(|m| !m.is_empty()).unwrap_or(false)
     }, "bob to see the message locally");
 

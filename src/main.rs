@@ -2,9 +2,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
+use ark::client::sync;
 use ark::context::create_client_context;
 use ark::types::IdentityContext;
-use ark_msg::{convo, message, reltime, sync, tui};
+use ark_msg::paths::APPS_MSG;
+use ark_msg::{convo, invite, message, reltime, tui};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -58,6 +60,7 @@ fn main() -> ExitCode {
 
 fn run() -> io::Result<()> {
     let ctx = create_client_context()?;
+    fs::create_dir_all(ctx.root.join(APPS_MSG))?;
     if std::env::args_os().len() <= 1 {
         return tui::run(ctx);
     }
@@ -139,12 +142,10 @@ fn cmd_convo_op(
 }
 
 fn cmd_sync(ctx: &IdentityContext) -> io::Result<()> {
-    let report = sync::run(ctx)?;
-    if !report.accepted.is_empty() {
-        println!("auto-accepted {} share proposal(s)", report.accepted.len());
-    }
-    for (name, err) in &report.failed {
-        eprintln!("auto-accept failed for {}: {}", name, err);
+    sync(ctx, &ctx.root.join(APPS_MSG), false, true, |_| false, |_| false)?;
+    let pending = invite::list(ctx).map(|v| v.len()).unwrap_or(0);
+    if pending > 0 {
+        println!("{} pending invite(s) — use TUI to join or dismiss", pending);
     }
     Ok(())
 }

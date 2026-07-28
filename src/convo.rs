@@ -6,7 +6,10 @@ use ark::client::{chmod, put};
 use ark::metadata::{drop, has_metadata_attributes, owner, read_metadata_attributes, reader, writer};
 use ark::types::{IdentityContext, Permission, Permissions};
 use serde::{Deserialize, Serialize};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
+use crate::message;
 use crate::paths::{convo_rel_path, convos_root, default_slug, make_dir_name, now_unix_secs, sanitize_slug};
 
 const CONVERSATION_JSON: &str = "conversation.json";
@@ -21,6 +24,7 @@ pub struct ConvoSummary {
     pub title: Option<String>,
     pub member_count: usize,
     pub owner_count: usize,
+    pub last_activity: OffsetDateTime,
 }
 
 /// Create a conversation dir with `members` as writers and the caller as
@@ -66,10 +70,11 @@ pub fn list(ctx: &IdentityContext) -> io::Result<Vec<ConvoSummary>> {
 
         let title = read_title(&path);
         let (member_count, owner_count) = count_members(&path).unwrap_or((0, 0));
+        let last_activity = last_activity(ctx, &dir_name);
 
-        summaries.push(ConvoSummary { dir_name, title, member_count, owner_count });
+        summaries.push(ConvoSummary { dir_name, title, member_count, owner_count, last_activity });
     }
-    summaries.sort_by(|a, b| a.dir_name.cmp(&b.dir_name));
+    summaries.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
     Ok(summaries)
 }
 
@@ -170,6 +175,22 @@ fn read_title(dir: &PathBuf) -> Option<String> {
     let bytes = fs::read(dir.join(CONVERSATION_JSON)).ok()?;
     let doc: ConversationDoc = serde_json::from_slice(&bytes).ok()?;
     Some(doc.title)
+}
+
+/// Newest message timestamp in the convo dir, else convo creation time
+/// (dir_name unix-secs suffix), else UNIX_EPOCH.
+fn last_activity(ctx: &IdentityContext, dir_name: &str) -> OffsetDateTime {
+    if let Ok(mut msgs) = message::list(ctx, dir_name) {
+        if let Some(latest) = msgs.pop() {
+            if let Ok(ts) = OffsetDateTime::parse(&latest.modified, &Rfc3339) {
+                return ts;
+            }
+        }
+    }
+    dir_name.rsplit_once('-')
+        .and_then(|(_, secs)| secs.parse::<i64>().ok())
+        .and_then(|s| OffsetDateTime::from_unix_timestamp(s).ok())
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
 fn count_members(dir: &PathBuf) -> io::Result<(usize, usize)> {
