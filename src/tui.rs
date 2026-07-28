@@ -117,8 +117,6 @@ impl App {
 }
 
 pub fn run(ctx: IdentityContext) -> io::Result<()> {
-    silence_stderr();
-
     let ctx = Arc::new(ctx);
 
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
@@ -332,16 +330,3 @@ fn block(title: &str, focused: bool) -> Block<'_> {
     Block::default().borders(Borders::ALL).title(title.to_string()).border_style(style)
 }
 
-// Ark's client emits progress via eprintln! (see ark_friction.md#12). Those
-// writes corrupt the ratatui frame. Silence fd 2 for the TUI's lifetime by
-// pointing it at /dev/null.
-fn silence_stderr() {
-    unsafe {
-        let path = b"/dev/null\0";
-        let fd = libc::open(path.as_ptr() as *const _, libc::O_WRONLY);
-        if fd >= 0 {
-            libc::dup2(fd, libc::STDERR_FILENO);
-            libc::close(fd);
-        }
-    }
-}

@@ -12,7 +12,7 @@ pub fn run(ctx: &IdentityContext) -> io::Result<AutoAcceptReport> {
     let path = ctx.root.join(APPS_MSG);
     std::fs::create_dir_all(&path)?;
     let report = auto_accept_convo_proposals(ctx)?;
-    sync(ctx, &path, false, true)?;
+    sync(ctx, &path, false, true, |_| {}, |_| false)?;
     Ok(report)
 }
 
