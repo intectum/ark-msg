@@ -19,6 +19,7 @@ pub struct ConversationDoc {
     pub title: String,
 }
 
+#[derive(Clone)]
 pub struct ConvoSummary {
     pub dir_name: String,
     pub title: Option<String>,

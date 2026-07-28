@@ -2,13 +2,11 @@
 
 Outstanding items from building the first non-trivial ark app. Ranked by app-side pain.
 
-## 1. Sync has no proposal-decision callback
+## 1. Proposals live outside the sync watch stream
 
-`sync` now takes `on_event(EntryEvent)` and `on_error(io::Error)` — reconciled entries fire per-file. But proposals are still a separate pre-pass: apps call `list_proposals` + `accept_proposal` before `sync`. An `on_proposal(&Proposal) -> Decision::Accept | Reject | Skip` fed into `sync` would let it drive acceptance in the same walk.
+`sync(watch=true)` surfaces reconciled file/dir events via `on_event(EntryEvent)`, but proposal-added / proposal-removed are not part of the stream. Apps that want to show invites in real time end up running a second loop: `ark_msg`'s TUI spawns `sync(watch=true)` in one thread and an interval poll of `list_proposals` in another (`src/tui.rs::spawn_file_watcher` + `spawn_invite_poller`). A `ProposalAdded` / `ProposalRemoved` action on the watch stream (or a `watch_proposals` primitive) would collapse those into one.
 
-ark_msg's `auto_accept_convo_proposals` still exists purely because sync can't drive proposal acceptance itself.
-
-- `ark/src/client/sync.rs`, `ark/src/client/proposals.rs`
+- `ark/src/client/sync.rs`, `ark/src/client/proposals.rs`, `ark/src/types.rs::EntryEvent`
 
 ## 2. File perms don't inherit from directory perms at write time
 
@@ -34,12 +32,11 @@ Wire-level docs live in `spec.md`; app-developer view lives only in README + Rus
 
 `ark-msg` two-account create+sync+send+read loop is ~2s. Underlying costs:
 
-1. **Synchronous relay per PUT.** `ark/src/server/relay.rs` forwards writes to co-members sequentially before returning. N members = N-1 network hops on the critical path. Fix: relay in a background thread; return after local write; log relay failures (idempotent retry queue). Or expose `X-Ark-Relay: async` for apps that don't need synchronous consistency.
-2. **`Connection: close` on every request.** `ark/src/client/request.rs` adds it unconditionally. Fresh TCP+TLS handshake per call. Fix: pool per (host, port), or at least keep-alive within a single sync/accept pass.
-3. **`accept_proposal` round-trips through both servers.** Bob's accept flow: GET from Alice → PUT to own → own server relays back to Alice. Alice already has the file. Fix: recognise a proposal-accept as "materialise a copy locally, no relay needed" — a distinct verb, or `X-Ark-Relay: none` on the internal PUT.
-4. **No batch endpoint for proposals or log entries.** Every `.http` entry costs one GET. A `POST /.ark/requests/batch` returning a JSON array would collapse M requests to 1.
+1. **`Connection: close` on every request.** `ark/src/client/request.rs` adds it unconditionally. Fresh TCP+TLS handshake per call. Fix: pool per (host, port), or at least keep-alive within a single sync/accept pass.
+2. **`accept_proposal` round-trips through both servers.** Bob's accept flow: GET from Alice → PUT to own → own server relays back to Alice. Alice already has the file. Fix: recognise a proposal-accept as "materialise a copy locally, no relay needed" — a distinct verb, or `X-Ark-Relay: none` on the internal PUT.
+3. **No batch endpoint for proposals or log entries.** Every `.http` entry costs one GET. A `POST /.ark/requests/batch` returning a JSON array would collapse M requests to 1.
 
-- `ark/src/server/relay.rs`, `ark/src/client/request.rs`, `ark/src/client/proposals.rs`, `ark/src/client/sync.rs`
+- `ark/src/client/request.rs`, `ark/src/client/proposals.rs`, `ark/src/client/sync.rs`
 
 ## Nice-to-haves
 

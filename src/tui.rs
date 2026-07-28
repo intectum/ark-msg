@@ -1,6 +1,6 @@
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -21,12 +21,14 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 
-const SYNC_INTERVAL: Duration = Duration::from_secs(5);
+const INVITE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 enum UiEvent {
     Key(crossterm::event::KeyEvent),
-    SyncStarted,
-    SyncDone(String),
+    /// Watch stream reported a local/remote change under `apps/msg/`.
+    LocalChanged,
+    InvitesLoaded(Vec<invite::InviteSummary>),
+    Error(String),
 }
 
 enum Pane { Convos, Input }
@@ -47,30 +49,38 @@ impl ListRow {
 
 struct App {
     ctx: Arc<IdentityContext>,
+    convos: Vec<convo::ConvoSummary>,
+    invites: Vec<invite::InviteSummary>,
     rows: Vec<ListRow>,
     list_state: ListState,
     messages: Vec<(message::MessageSummary, String)>,
     input: String,
     pane: Pane,
-    status: String,
+    error: Option<String>,
     quit: bool,
-    sync_trigger: Sender<()>,
+    /// Coalesces bursts of watch events into one reload per redraw tick.
+    dirty: bool,
+    invite_trigger: Sender<()>,
 }
 
 impl App {
-    fn new(ctx: Arc<IdentityContext>, sync_trigger: Sender<()>) -> Self {
+    fn new(ctx: Arc<IdentityContext>, invite_trigger: Sender<()>) -> Self {
         let mut app = Self {
             ctx,
+            convos: Vec::new(),
+            invites: Vec::new(),
             rows: Vec::new(),
             list_state: ListState::default(),
             messages: Vec::new(),
             input: String::new(),
             pane: Pane::Convos,
-            status: "starting...".into(),
+            error: None,
             quit: false,
-            sync_trigger,
+            dirty: false,
+            invite_trigger,
         };
-        app.reload_rows();
+        app.reload_convos();
+        app.rebuild_rows();
         if !app.rows.is_empty() {
             app.list_state.select(Some(0));
             app.reload_messages();
@@ -78,23 +88,25 @@ impl App {
         app
     }
 
-    fn reload_rows(&mut self) {
+    /// Refresh local convo list (fast, disk-only).
+    fn reload_convos(&mut self) {
+        match convo::list(&self.ctx) {
+            Ok(v) => { self.convos = v; }
+            Err(e) => { self.error = Some(format!("list error: {}", e)); }
+        }
+    }
+
+    /// Combine convos + invites into `rows`, sort desc by activity, preserve
+    /// selection by stable row key.
+    fn rebuild_rows(&mut self) {
         let prev_key = self.selected_key();
 
-        let mut rows: Vec<ListRow> = Vec::new();
-        match convo::list(&self.ctx) {
-            Ok(v) => rows.extend(v.into_iter().map(ListRow::Convo)),
-            Err(e) => { self.status = format!("list error: {}", e); }
-        }
-        match invite::list(&self.ctx) {
-            Ok(v) => rows.extend(v.into_iter().map(ListRow::Invite)),
-            Err(e) => { self.status = format!("invite list error: {}", e); }
-        }
+        let mut rows: Vec<ListRow> = Vec::with_capacity(self.convos.len() + self.invites.len());
+        rows.extend(self.convos.iter().cloned().map(ListRow::Convo));
+        rows.extend(self.invites.iter().cloned().map(ListRow::Invite));
         rows.sort_by(|a, b| b.activity().cmp(&a.activity()));  // most recent first
         self.rows = rows;
 
-        // Preserve selection across reloads: match by dir/proposal key, else
-        // clamp to available range.
         let new_idx = prev_key
             .and_then(|k| self.rows.iter().position(|r| row_key(r) == k))
             .or(if self.rows.is_empty() { None } else { Some(0) });
@@ -108,7 +120,7 @@ impl App {
         };
         match message::read(&self.ctx, &dir, None) {
             Ok(msgs) => { self.messages = msgs; }
-            Err(e) => { self.status = format!("read error: {}", e); }
+            Err(e) => { self.error = Some(format!("read error: {}", e)); }
         }
     }
 
@@ -127,9 +139,9 @@ impl App {
         }
     }
 
-    fn selected_invite_id(&self) -> Option<String> {
+    fn selected_invite(&self) -> Option<invite::InviteSummary> {
         match self.selected()? {
-            ListRow::Invite(i) => Some(i.proposal_id.clone()),
+            ListRow::Invite(i) => Some(i.clone()),
             ListRow::Convo(_) => None,
         }
     }
@@ -145,52 +157,60 @@ impl App {
     fn send(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() { return; }
-        let Some(dir) = self.selected_convo_dir() else {
-            self.status = "no conversation selected".into();
-            return;
-        };
+        let Some(dir) = self.selected_convo_dir() else { return; };
         match message::send(&self.ctx, &dir, text.as_bytes()) {
             Ok(_) => {
                 self.input.clear();
-                self.status = "sent".into();
+                self.error = None;
                 self.reload_messages();
             }
-            Err(e) => { self.status = format!("send error: {}", e); }
+            Err(e) => { self.error = Some(format!("send error: {}", e)); }
         }
     }
 
     fn accept_invite(&mut self) {
-        let Some(id) = self.selected_invite_id() else { return; };
-        match accept_proposal(&self.ctx, &id, false) {
-            Ok(()) => {
-                self.status = "joined — syncing...".into();
-                self.trigger_sync();
+        let Some(inv) = self.selected_invite() else { return; };
+        let mut errors = 0;
+        for id in &inv.proposal_ids {
+            if let Err(e) = accept_proposal(&self.ctx, id, false) {
+                errors += 1;
+                self.error = Some(format!("accept error: {}", e));
             }
-            Err(e) => { self.status = format!("accept error: {}", e); }
         }
+        if errors == 0 {
+            self.error = None;
+        }
+        self.invites.retain(|i| i.dir_name != inv.dir_name);
+        self.rebuild_rows();
+        self.trigger_invite_refresh();
     }
 
     fn reject_invite(&mut self) {
-        let Some(id) = self.selected_invite_id() else { return; };
-        match reject_proposal(&self.ctx, &id) {
-            Ok(()) => {
-                self.status = "invite dismissed".into();
-                self.reload_rows();
-                self.reload_messages();
+        let Some(inv) = self.selected_invite() else { return; };
+        let mut errors = 0;
+        for id in &inv.proposal_ids {
+            if let Err(e) = reject_proposal(&self.ctx, id) {
+                errors += 1;
+                self.error = Some(format!("reject error: {}", e));
             }
-            Err(e) => { self.status = format!("reject error: {}", e); }
         }
+        if errors == 0 {
+            self.error = None;
+        }
+        self.invites.retain(|i| i.dir_name != inv.dir_name);
+        self.rebuild_rows();
+        self.reload_messages();
     }
 
-    fn trigger_sync(&self) {
-        let _ = self.sync_trigger.send(());
+    fn trigger_invite_refresh(&self) {
+        let _ = self.invite_trigger.send(());
     }
 }
 
 fn row_key(row: &ListRow) -> String {
     match row {
         ListRow::Convo(c) => format!("c:{}", c.dir_name),
-        ListRow::Invite(i) => format!("i:{}", i.proposal_id),
+        ListRow::Invite(i) => format!("i:{}", i.dir_name),
     }
 }
 
@@ -199,10 +219,10 @@ pub fn run(ctx: IdentityContext) -> io::Result<()> {
 
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
     spawn_input_reader(ui_tx.clone());
-    let sync_trigger = spawn_sync_worker(ctx.clone(), ui_tx.clone());
+    spawn_file_watcher(ctx.clone(), ui_tx.clone());
+    let invite_trigger = spawn_invite_poller(ctx.clone(), ui_tx.clone());
 
-    let mut app = App::new(ctx, sync_trigger);
-    app.trigger_sync();
+    let mut app = App::new(ctx, invite_trigger);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -233,18 +253,47 @@ fn spawn_input_reader(tx: Sender<UiEvent>) {
     });
 }
 
-fn spawn_sync_worker(ctx: Arc<IdentityContext>, ui_tx: Sender<UiEvent>) -> Sender<()> {
+/// Start `sync(watch=true)` in a background thread. `on_event` fires per
+/// reconciled entry; we coalesce into a single `LocalChanged` per event and
+/// let the UI dedup via its `dirty` flag. The watch call blocks until
+/// unrecoverable error, at which point we report status and exit.
+fn spawn_file_watcher(ctx: Arc<IdentityContext>, ui_tx: Sender<UiEvent>) {
+    thread::spawn(move || {
+        // Both callbacks must be Fn + Send + Sync; wrap Sender in Arc<Mutex<_>>.
+        let event_tx = Arc::new(Mutex::new(ui_tx.clone()));
+        let error_tx = event_tx.clone();
+
+        let on_event = move |_ev| {
+            let _ = event_tx.lock().unwrap().send(UiEvent::LocalChanged);
+            false
+        };
+        let on_error = move |e: io::Error| {
+            let _ = error_tx.lock().unwrap().send(UiEvent::Error(format!("watch: {}", e)));
+            false
+        };
+
+        let path = ctx.root.join(APPS_MSG);
+        if let Err(e) = sync(&ctx, &path, true, true, on_event, on_error) {
+            let _ = ui_tx.send(UiEvent::Error(format!("watch died: {}", e)));
+        }
+    });
+}
+
+/// Poll invites on interval or on manual trigger. Returns a trigger channel
+/// callers use to wake the poller (e.g. after accept/reject).
+fn spawn_invite_poller(ctx: Arc<IdentityContext>, ui_tx: Sender<UiEvent>) -> Sender<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<()>();
     thread::spawn(move || {
-        let path = ctx.root.join(APPS_MSG);
         loop {
-            let _ = ui_tx.send(UiEvent::SyncStarted);
-            let status = match sync(&ctx, &path, false, true, |_| false, |_| false) {
-                Ok(()) => "synced".to_string(),
-                Err(e) => format!("sync error: {}", e),
-            };
-            if ui_tx.send(UiEvent::SyncDone(status)).is_err() { break; }
-            let _ = cmd_rx.recv_timeout(SYNC_INTERVAL);
+            match invite::list(&ctx) {
+                Ok(v) => {
+                    if ui_tx.send(UiEvent::InvitesLoaded(v)).is_err() { break; }
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("invite fetch: {}", e)));
+                }
+            }
+            let _ = cmd_rx.recv_timeout(INVITE_POLL_INTERVAL);
         }
     });
     cmd_tx
@@ -259,14 +308,20 @@ fn run_loop<B: ratatui::backend::Backend>(
     while !app.quit {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(UiEvent::Key(key)) => handle_key(app, key),
-            Ok(UiEvent::SyncStarted) => { app.status = "syncing...".into(); }
-            Ok(UiEvent::SyncDone(msg)) => {
-                app.status = msg;
-                app.reload_rows();
-                app.reload_messages();
+            Ok(UiEvent::LocalChanged) => { app.dirty = true; }
+            Ok(UiEvent::InvitesLoaded(v)) => {
+                app.invites = v;
+                app.rebuild_rows();
             }
+            Ok(UiEvent::Error(s)) => { app.error = Some(s); }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if app.dirty {
+            app.dirty = false;
+            app.reload_convos();
+            app.rebuild_rows();
+            app.reload_messages();
         }
         terminal.draw(|f| ui(f, app))?;
     }
@@ -283,7 +338,6 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
             KeyCode::Char('j') | KeyCode::Down => app.move_row(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_row(-1),
-            KeyCode::Char('r') => app.trigger_sync(),
             KeyCode::Char('a') => app.accept_invite(),
             KeyCode::Char('d') => app.reject_invite(),
             KeyCode::Tab | KeyCode::Enter | KeyCode::Char('i')
@@ -434,17 +488,20 @@ fn draw_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
 fn draw_status(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let addr = &app.ctx.identity.address;
     let is_invite = matches!(app.selected(), Some(ListRow::Invite(_)));
-    let hint = match app.pane {
-        Pane::Convos if is_invite => "j/k select  a join  d dismiss  r sync  q quit",
-        Pane::Convos => "j/k select  r sync  Tab/i input  q quit",
-        Pane::Input => "Enter send  Esc/Tab back",
+    let tail = if let Some(err) = &app.error {
+        Span::styled(err.clone(), Style::default().fg(Color::Red))
+    } else {
+        let hint = match app.pane {
+            Pane::Convos if is_invite => "j/k select  a join  d dismiss  q quit",
+            Pane::Convos => "j/k select  Tab/i input  q quit",
+            Pane::Input => "Enter send  Esc/Tab back",
+        };
+        Span::styled(hint, Style::default().fg(Color::DarkGray))
     };
     let line = Line::from(vec![
         Span::styled(format!(" {} ", addr), Style::default().fg(Color::Green)),
         Span::raw(" | "),
-        Span::raw(&app.status),
-        Span::raw("  "),
-        Span::styled(hint, Style::default().fg(Color::DarkGray)),
+        tail,
     ]);
     f.render_widget(Paragraph::new(line), area);
 }

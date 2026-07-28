@@ -92,14 +92,18 @@ fn end_to_end_two_accounts() {
     let invites = invite::list(&bob).unwrap();
     assert!(!invites.is_empty(), "expected at least one pending invite");
     let convo_invite = invites.iter().find(|i| i.dir_name == dir_name).expect("invite for created convo");
-    accept_proposal(&bob, &convo_invite.proposal_id, false).unwrap();
+    for id in &convo_invite.proposal_ids {
+        accept_proposal(&bob, id, false).unwrap();
+    }
 
     // Sync so bob pulls conversation.json (its proposal is written by alice
     // after the dir is created and must also be accepted).
     wait_for(|| {
         sync_msg(&bob);
         for i in invite::list(&bob).unwrap() {
-            let _ = accept_proposal(&bob, &i.proposal_id, false);
+            for id in &i.proposal_ids {
+                let _ = accept_proposal(&bob, id, false);
+            }
         }
         let convos = convo::list(&bob).unwrap();
         !convos.is_empty() && convos[0].dir_name == dir_name
