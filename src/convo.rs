@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use ark::client::{chmod, put};
+use ark::client::{put, put_permissions};
 use ark::metadata::{drop, has_metadata_attributes, owner, read_metadata_attributes, reader, writer};
 use ark::timestamp;
 use ark::types::{IdentityContext, Permission, Permissions};
@@ -106,45 +106,41 @@ pub fn resolve(ctx: &IdentityContext, arg: &str) -> io::Result<String> {
 
 pub fn add_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
-    let local_dir = ctx.root.join(&rel);
-    chmod(ctx, local_dir.to_str().unwrap(), &writer(addr), false)?;
+    put_permissions(ctx, &format!("/{}", rel), &writer(addr))?;
 
-    let json_path = local_dir.join(CONVERSATION_JSON);
-    if json_path.exists() {
-        chmod(ctx, json_path.to_str().unwrap(), &reader(addr), false)?;
+    let json_rel = format!("{}/{}", rel, CONVERSATION_JSON);
+    if ctx.root.join(&json_rel).exists() {
+        put_permissions(ctx, &format!("/{}", json_rel), &reader(addr))?;
     }
     Ok(())
 }
 
 pub fn remove_member(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
-    let local_dir = ctx.root.join(&rel);
-    chmod(ctx, local_dir.to_str().unwrap(), &drop(addr), false)?;
+    put_permissions(ctx, &format!("/{}", rel), &drop(addr))?;
 
-    let json_path = local_dir.join(CONVERSATION_JSON);
-    if json_path.exists() {
-        chmod(ctx, json_path.to_str().unwrap(), &drop(addr), false)?;
+    let json_rel = format!("{}/{}", rel, CONVERSATION_JSON);
+    if ctx.root.join(&json_rel).exists() {
+        put_permissions(ctx, &format!("/{}", json_rel), &drop(addr))?;
     }
     Ok(())
 }
 
 pub fn promote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
-    let local_dir = ctx.root.join(&rel);
-    chmod(ctx, local_dir.to_str().unwrap(), &owner(addr), false)?;
+    put_permissions(ctx, &format!("/{}", rel), &owner(addr))?;
 
-    let json_path = local_dir.join(CONVERSATION_JSON);
-    if json_path.exists() {
-        chmod(ctx, json_path.to_str().unwrap(), &owner(addr), false)?;
+    let json_rel = format!("{}/{}", rel, CONVERSATION_JSON);
+    if ctx.root.join(&json_rel).exists() {
+        put_permissions(ctx, &format!("/{}", json_rel), &owner(addr))?;
     }
     Ok(())
 }
 
 pub fn demote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
-    let local_dir = ctx.root.join(&rel);
     if addr == ctx.identity.address {
-        let meta = read_metadata_attributes(&local_dir)?;
+        let meta = read_metadata_attributes(&ctx.root.join(&rel))?;
         let other_owners = meta.members.iter()
             .filter(|m| m.permission == Permission::Owner && m.address != ctx.identity.address)
             .count();
@@ -152,12 +148,11 @@ pub fn demote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<(
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot demote self: no other owner"));
         }
     }
-    chmod(ctx, local_dir.to_str().unwrap(), &writer(addr), false)?;
+    put_permissions(ctx, &format!("/{}", rel), &writer(addr))?;
 
-    let json_path = local_dir.join(CONVERSATION_JSON);
-    if json_path.exists() {
-        // Convo writer = JSON reader (title read-only for non-owners).
-        chmod(ctx, json_path.to_str().unwrap(), &reader(addr), false)?;
+    let json_rel = format!("{}/{}", rel, CONVERSATION_JSON);
+    if ctx.root.join(&json_rel).exists() {
+        put_permissions(ctx, &format!("/{}", json_rel), &reader(addr))?;
     }
     Ok(())
 }

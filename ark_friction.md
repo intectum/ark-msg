@@ -10,13 +10,13 @@ Outstanding items from building the first non-trivial ark app. Ranked by app-sid
 
 ## 2. File perms don't inherit from directory perms at write time
 
-`create` and every membership op still make two independent `chmod` calls — one for the dir, one for `conversation.json` — because there's no "apply members from parent" option. A `put` / `chmod` flag like `inherit_readers_from_parent: bool` (or `apply_members_from(parent_path)`) would collapse the dir+doc pair to one round-trip.
+`create` and every membership op still make two independent `put_permissions` calls — one for the dir, one for `conversation.json` — because there's no "apply members from parent" option. A `put` / `put_permissions` flag like `inherit_readers_from_parent: bool` (or `apply_members_from(parent_path)`) would collapse the dir+doc pair to one round-trip.
 
-## 3. Identity resolution is implicit and can fail late
+## 3. Membership ops hide an extra identity-fetch round-trip
 
-`chmod` on an encrypted file for a new member calls `resolve_identity`, which fetches from the member's server if not cached. If that server is down, chmod fails after the app assumed it was a local staging op. Split into (a) a pure-local metadata edit and (b) an explicit "prepare identity for encrypted file" step — or expose `prefetch_identity(ctx, addr)` so apps can front-load the fetch at "add contact" time.
+`put_permissions` on an encrypted file for a new member calls `resolve_identity` inside `apply_permission`, which fetches from the member's server if not cached. That fetch is a hidden second network dependency on top of the PUT itself — if the member's server is down, the whole op fails partway through, and the app has no way to front-load or retry the identity step independently. Split into (a) a pure metadata edit and (b) an explicit "wrap file key for member" step — or expose `prefetch_identity(ctx, addr)` so apps can pull identities at "add contact" time.
 
-- `ark/src/client/chmod.rs`, `ark/src/identity.rs::resolve_identity`
+- `ark/src/client/put.rs`, `ark/src/metadata.rs::apply_permission`, `ark/src/identity.rs::resolve_identity`
 
 ## 4. No "members changed" watch event
 
