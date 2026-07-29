@@ -121,7 +121,7 @@ fn cmd_read(ctx: &IdentityContext, convo_arg: String, last: Option<usize>) -> io
     let msgs = message::read(ctx, &dir, last)?;
     let mut stdout = io::stdout().lock();
     for (summary, body) in msgs {
-        writeln!(stdout, "[{}] {}", reltime::relative(&summary.modified), summary.sender)?;
+        writeln!(stdout, "[{}] {}", reltime::relative(summary.modified), summary.sender)?;
         stdout.write_all(body.as_bytes())?;
         if !body.ends_with('\n') { writeln!(stdout)?; }
         writeln!(stdout)?;

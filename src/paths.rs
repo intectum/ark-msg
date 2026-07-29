@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use ark::timestamp;
 
 pub const APPS_MSG: &str = "apps/msg";
 pub const CONVOS_SUBDIR: &str = "convos";
@@ -9,10 +9,6 @@ pub fn convos_root() -> String {
 
 pub fn convo_rel_path(dir_name: &str) -> String {
     format!("{}/{}", convos_root(), dir_name)
-}
-
-pub fn now_unix_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
 /// Sanitize a caller-provided slug: keep `[a-z0-9-]`, collapse others to `-`,
@@ -46,8 +42,8 @@ pub fn default_slug(members: &[String]) -> String {
         .unwrap_or_else(|| "convo".to_string())
 }
 
-pub fn make_dir_name(slug: &str, ts: u64) -> String {
-    format!("{}-{}", slug, ts)
+pub fn make_dir_name(slug: &str) -> String {
+    format!("{}_{}", timestamp::format_fs_safe(timestamp::now()), slug)
 }
 
 #[cfg(test)]
@@ -69,8 +65,4 @@ mod tests {
         assert_eq!(default_slug(&[]), "convo");
     }
 
-    #[test]
-    fn dir_name_format() {
-        assert_eq!(make_dir_name("hi", 123), "hi-123");
-    }
 }

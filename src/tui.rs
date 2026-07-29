@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use ark::client::{accept_proposal, reject_proposal, sync};
 use ark::types::IdentityContext;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::paths::APPS_MSG;
@@ -416,7 +415,6 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, area: Rect) {
 }
 
 fn draw_invite_card(f: &mut ratatui::Frame, invite: &invite::InviteSummary, area: Rect) {
-    let modified_iso = invite.modified.format(&Rfc3339).unwrap_or_default();
     let lines = vec![
         Line::from(vec![
             Span::styled("Convo: ", Style::default().fg(Color::DarkGray)),
@@ -428,7 +426,7 @@ fn draw_invite_card(f: &mut ratatui::Frame, invite: &invite::InviteSummary, area
         ]),
         Line::from(vec![
             Span::styled("When:  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(reltime::relative(&modified_iso)),
+            Span::raw(reltime::relative(invite.modified)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -446,7 +444,7 @@ fn draw_messages(f: &mut ratatui::Frame, app: &App, convo: &convo::ConvoSummary,
     let title = convo.title.clone().unwrap_or_else(|| convo.dir_name.clone());
     let lines: Vec<Line> = app.messages.iter().flat_map(|(s, body)| {
         let head = Line::from(vec![
-            Span::styled(format!("[{}] ", reltime::relative(&s.modified)), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("[{}] ", reltime::relative(s.modified)), Style::default().fg(Color::DarkGray)),
             Span::styled(s.sender.clone(), Style::default().fg(Color::Cyan)),
         ]);
         let mut out = vec![head];

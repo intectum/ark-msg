@@ -1,8 +1,7 @@
-use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::{Duration, OffsetDateTime, UtcOffset, Weekday};
 
-/// Format an RFC 3339 timestamp relative to now, in local time.
+/// Format a timestamp relative to now, in local time.
 ///
 /// - <45s: "now"
 /// - <60m: "N min ago"
@@ -10,10 +9,7 @@ use time::{Duration, OffsetDateTime, UtcOffset, Weekday};
 /// - previous local day: "yesterday HH:MM"
 /// - <7 days: weekday name + local HH:MM
 /// - >=7 days: YYYY-MM-DD
-pub fn relative(iso: &str) -> String {
-    let Ok(ts_utc) = OffsetDateTime::parse(iso, &Rfc3339) else {
-        return iso.to_string();
-    };
+pub fn relative(ts_utc: OffsetDateTime) -> String {
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     let ts = ts_utc.to_offset(offset);
     let now = OffsetDateTime::now_utc().to_offset(offset);
@@ -113,10 +109,5 @@ mod tests {
         let now = datetime!(2026-07-26 12:00:00 UTC);
         let ts = datetime!(2027-01-01 00:00:00 UTC);
         assert_eq!(fmt_at(now, ts), "2027-01-01");
-    }
-
-    #[test]
-    fn parse_error_returns_original() {
-        assert_eq!(relative("not-a-date"), "not-a-date");
     }
 }

@@ -40,7 +40,4 @@ Wire-level docs live in `spec.md`; app-developer view lives only in README + Rus
 
 ## Nice-to-haves
 
-- Parent-dir semantics undocumented. The server `create_dir_all`s intermediate paths on both file and dir PUTs (`ark/src/server/put.rs:60,62`), and `authorize` only checks the target's own metadata — no walk-up-tree. So `PUT apps/msg/convos/foo/` works with no `apps/`, `apps/msg/`, `apps/msg/convos/` metadata anywhere. Nothing in README/spec.md says this. Add a spec.md line: "intermediate directories are created without metadata; access checks are per-target, not walked."
-- `now_iso_fs` — great helper, only exported by `ark::util`. Its `_fs` suffix (colon-safe for Windows/URL) isn't obvious. Rename or doc.
 - `Permission::parse` returns `Option`; a `TryFrom<&str>` impl would compose better with clap/serde.
-- `start_test_server` is `#[cfg(test)]` on ark's side, so downstream integration tests can't use it. Every consumer copy-pastes the same 4-line spawn (`TcpListener::bind` + `create_server_context` + `thread::spawn(serve)`). Expose behind a `test-utils` feature, or ship a `TestServer` helper.

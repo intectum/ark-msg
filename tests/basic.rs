@@ -1,14 +1,12 @@
 use std::env;
 use std::fs;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ark::client::{accept_proposal, init, sync};
-use ark::context::{create_client_context, create_server_context};
-use ark::server::serve;
+use ark::context::create_client_context;
+use ark::server::start_test_server;
 use ark::types::IdentityContext;
 use ark_msg::paths::APPS_MSG;
 use ark_msg::{convo, invite, message};
@@ -17,14 +15,6 @@ fn sync_msg(ctx: &IdentityContext) {
     let path = ctx.root.join(APPS_MSG);
     fs::create_dir_all(&path).unwrap();
     sync(ctx, &path, false, true, |_| false, |_| false).unwrap();
-}
-
-fn start_test_server(root: PathBuf) -> u16 {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-    let port = listener.local_addr().unwrap().port();
-    let server_ctx = create_server_context(&root, &format!("127.0.0.1:{}", port)).expect("init server identity");
-    thread::spawn(move || serve(listener, server_ctx, false));
-    port
 }
 
 // Shared lock: ark_msg uses cwd for context resolution, so tests within a
@@ -79,7 +69,7 @@ fn end_to_end_two_accounts() {
     env::set_current_dir(root.join("alice")).unwrap();
     let alice = create_client_context().unwrap();
     let dir_name = convo::create(&alice, "hello", Some("greeting"), &[bob_addr.clone()]).unwrap();
-    assert!(dir_name.starts_with("greeting-"), "dir name should start with slug, got {}", dir_name);
+    assert!(dir_name.ends_with("_greeting"), "dir name should end with slug, got {}", dir_name);
 
     // A proposal should arrive on Bob's server.
     let bob_requests = root.join("ark/bob/.ark/requests");

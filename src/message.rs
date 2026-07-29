@@ -3,8 +3,9 @@ use std::io;
 
 use ark::client::put;
 use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
+use ark::timestamp::{format_fs_safe, now};
 use ark::types::{IdentityContext, Permissions};
-use ark::util::now_iso_fs;
+use time::OffsetDateTime;
 
 use crate::convo;
 use crate::paths::convo_rel_path;
@@ -15,7 +16,7 @@ const MSG_SUFFIX: &str = ".md";
 pub struct MessageSummary {
     pub file_name: String,
     pub sender: String,
-    pub modified: String,
+    pub modified: OffsetDateTime,
 }
 
 /// Send a message: write body as a new `msg-<ts>.md` in the convo dir with
@@ -32,7 +33,7 @@ pub fn send(ctx: &IdentityContext, dir_name: &str, body: &[u8]) -> io::Result<St
         .filter(|a| a != &ctx.identity.address)
         .collect();
 
-    let file_name = format!("{}{}{}", MSG_PREFIX, now_iso_fs(), MSG_SUFFIX);
+    let file_name = format!("{}{}{}", MSG_PREFIX, format_fs_safe(now()), MSG_SUFFIX);
     let file_path = local_dir.join(&file_name);
     fs::write(&file_path, body)?;
     let perms = Permissions { readers: others, ..Default::default() };
@@ -79,7 +80,7 @@ pub fn read(ctx: &IdentityContext, dir_name: &str, last_n: Option<usize>) -> io:
         out.push((MessageSummary {
             file_name: summary.file_name.clone(),
             sender: summary.sender.clone(),
-            modified: summary.modified.clone(),
+            modified: summary.modified,
         }, body));
     }
     Ok(out)

@@ -4,13 +4,13 @@ use std::path::PathBuf;
 
 use ark::client::{chmod, put};
 use ark::metadata::{drop, has_metadata_attributes, owner, read_metadata_attributes, reader, writer};
+use ark::timestamp;
 use ark::types::{IdentityContext, Permission, Permissions};
 use serde::{Deserialize, Serialize};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::message;
-use crate::paths::{convo_rel_path, convos_root, default_slug, make_dir_name, now_unix_secs, sanitize_slug};
+use crate::paths::{convo_rel_path, convos_root, default_slug, make_dir_name, sanitize_slug};
 
 const CONVERSATION_JSON: &str = "conversation.json";
 
@@ -30,7 +30,7 @@ pub struct ConvoSummary {
 
 /// Create a conversation dir with `members` as writers and the caller as
 /// owner, then write and share a `conversation.json`. Returns the dir name
-/// (e.g. `bob-1699999999`).
+/// (e.g. `2026-07-28T13-45-07.123Z_bob`).
 pub fn create(
     ctx: &IdentityContext,
     title: &str,
@@ -38,7 +38,7 @@ pub fn create(
     members: &[String],
 ) -> io::Result<String> {
     let slug = slug.map(sanitize_slug).unwrap_or_else(|| default_slug(members));
-    let dir_name = make_dir_name(&slug, now_unix_secs());
+    let dir_name = make_dir_name(&slug);
     let rel = convo_rel_path(&dir_name);
 
     let local_dir = ctx.root.join(&rel);
@@ -80,26 +80,27 @@ pub fn list(ctx: &IdentityContext) -> io::Result<Vec<ConvoSummary>> {
 }
 
 /// Resolve a caller-provided `<convo>` argument to a full dir name.
-/// Accepts an exact dir name, or a prefix that matches exactly one convo.
+/// Accepts an exact dir name, or a suffix that matches exactly one convo
+/// (typically the slug portion after the timestamp prefix).
 pub fn resolve(ctx: &IdentityContext, arg: &str) -> io::Result<String> {
     let root = ctx.root.join(convos_root());
     if !root.exists() {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("no conversation matches '{}'", arg)));
     }
     let mut exact = None;
-    let mut prefix: Vec<String> = Vec::new();
+    let mut suffix: Vec<String> = Vec::new();
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
         if !entry.file_type()?.is_dir() { continue; }
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == arg { exact = Some(name.clone()); }
-        if name.starts_with(arg) { prefix.push(name); }
+        if name.ends_with(arg) { suffix.push(name); }
     }
     if let Some(n) = exact { return Ok(n); }
-    match prefix.len() {
-        1 => Ok(prefix.remove(0)),
+    match suffix.len() {
+        1 => Ok(suffix.remove(0)),
         0 => Err(io::Error::new(io::ErrorKind::NotFound, format!("no conversation matches '{}'", arg))),
-        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("ambiguous conversation '{}': matches {:?}", arg, prefix))),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("ambiguous conversation '{}': matches {:?}", arg, suffix))),
     }
 }
 
@@ -179,18 +180,15 @@ fn read_title(dir: &PathBuf) -> Option<String> {
 }
 
 /// Newest message timestamp in the convo dir, else convo creation time
-/// (dir_name unix-secs suffix), else UNIX_EPOCH.
+/// (ark timestamp prefix on dir_name), else UNIX_EPOCH.
 fn last_activity(ctx: &IdentityContext, dir_name: &str) -> OffsetDateTime {
     if let Ok(mut msgs) = message::list(ctx, dir_name) {
         if let Some(latest) = msgs.pop() {
-            if let Ok(ts) = OffsetDateTime::parse(&latest.modified, &Rfc3339) {
-                return ts;
-            }
+            return latest.modified;
         }
     }
-    dir_name.rsplit_once('-')
-        .and_then(|(_, secs)| secs.parse::<i64>().ok())
-        .and_then(|s| OffsetDateTime::from_unix_timestamp(s).ok())
+    dir_name.split_once('_')
+        .and_then(|(stamp, _)| timestamp::parse_fs_safe(stamp).ok())
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 

@@ -3,7 +3,6 @@ use std::io;
 
 use ark::client::list_proposals;
 use ark::types::IdentityContext;
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::paths::convos_root;
@@ -28,8 +27,7 @@ pub fn list(ctx: &IdentityContext) -> io::Result<Vec<InviteSummary>> {
         let dir_name = after.split('/').next().unwrap_or("").to_string();
         if dir_name.is_empty() { continue; }
 
-        let modified = OffsetDateTime::parse(&proposal.metadata.modified, &Rfc3339)
-            .unwrap_or(OffsetDateTime::UNIX_EPOCH);
+        let modified = proposal.metadata.modified;
 
         by_dir.entry(dir_name.clone())
             .and_modify(|inv| {
