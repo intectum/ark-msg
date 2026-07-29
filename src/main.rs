@@ -152,8 +152,9 @@ fn cmd_sync(ctx: &IdentityContext) -> io::Result<()> {
 
 fn cmd_members(ctx: &IdentityContext, convo_arg: String) -> io::Result<()> {
     let dir = convo::resolve(ctx, &convo_arg)?;
-    for m in convo::members(ctx, &dir)? {
-        println!("{}", m);
+    let path = ctx.root.join(ark_msg::paths::convo_rel_path(&dir));
+    for m in ark::metadata::read_metadata_attributes(&path)?.members {
+        println!("{}", m.address);
     }
     Ok(())
 }

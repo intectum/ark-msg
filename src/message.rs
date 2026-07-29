@@ -3,11 +3,11 @@ use std::io;
 
 use ark::client::put;
 use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
+use ark::permissions::{assign, without};
 use ark::timestamp::{format_fs_safe, now};
-use ark::types::{IdentityContext, Permissions};
+use ark::types::{IdentityContext, Permission};
 use time::OffsetDateTime;
 
-use crate::convo;
 use crate::paths::convo_rel_path;
 
 const MSG_PREFIX: &str = "msg-";
@@ -28,15 +28,12 @@ pub fn send(ctx: &IdentityContext, dir_name: &str, body: &[u8]) -> io::Result<St
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("conversation dir missing: {}", local_dir.display())));
     }
 
-    let others: Vec<String> = convo::members(ctx, dir_name)?
-        .into_iter()
-        .filter(|a| a != &ctx.identity.address)
-        .collect();
+    let meta = read_metadata_attributes(&local_dir)?;
+    let perms = assign(&without(&meta.members, &ctx.identity.address), Permission::Reader);
 
     let file_name = format!("{}{}{}", MSG_PREFIX, format_fs_safe(now()), MSG_SUFFIX);
     let file_path = local_dir.join(&file_name);
     fs::write(&file_path, body)?;
-    let perms = Permissions { readers: others, ..Default::default() };
     put(ctx, &format!("/{}/{}", rel, file_name), Some(file_path.to_str().unwrap()), &perms, None, false)?;
 
     Ok(file_name)

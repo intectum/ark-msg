@@ -8,9 +8,9 @@ Outstanding items from building the first non-trivial ark app. Ranked by app-sid
 
 - `ark/src/client/sync.rs`, `ark/src/client/proposals.rs`, `ark/src/types.rs::EntryEvent`
 
-## 2. File perms don't inherit from directory perms at write time
+## 2. Membership ops fan out to one PUT per file
 
-`create` and every membership op still make two independent `put_permissions` calls — one for the dir, one for `conversation.json` — because there's no "apply members from parent" option. A `put` / `put_permissions` flag like `inherit_readers_from_parent: bool` (or `apply_members_from(parent_path)`) would collapse the dir+doc pair to one round-trip.
+Every membership change on a convo fires N `put_permissions` — one for the dir, one per shared file — because there's no server-side "apply to dir + N children in one relay pass." A recursive flag on `put_permissions` (dir → subtree), or a batch request endpoint, would collapse the fan-out.
 
 ## 3. Membership ops hide an extra identity-fetch round-trip
 
@@ -18,25 +18,20 @@ Outstanding items from building the first non-trivial ark app. Ranked by app-sid
 
 - `ark/src/client/put.rs`, `ark/src/metadata.rs::apply_permission`, `ark/src/identity.rs::resolve_identity`
 
-## 4. No "members changed" watch event
+## 4. `Metadata` events carry no delta
 
-`watch_remote` emits Created/Modified/Deleted on files. An app wanting to notify "Carol was added to this convo" has to diff metadata after each event. A dedicated `MetadataChanged` action (or embedding new metadata in `Modified` events) would remove the diff.
+`sync` now emits `EntryAction::Metadata` for metadata-only remote changes, but the event carries only `path` + `action`. By the time it fires, `write_metadata_attributes` has already overwritten local xattrs with the new state, and `LocalMetadata` doesn't snapshot prior members. An app wanting to notify "Carol was added" has no ark-provided way to compute the delta — it needs its own out-of-band snapshot. Fix: carry the pre-write member list in the event, or stash it in `LocalMetadata` before overwriting.
 
-- `ark/src/client/watch.rs`, `ark/src/types.rs::WatchAction`
+- `ark/src/client/sync.rs` (write at line 335, emit at line 340), `ark/src/types.rs::EntryEvent`, `ark/src/types.rs::LocalMetadata`
 
-## 5. No "building on ark" guide
+## 5. Cold sync burst cost
 
-Wire-level docs live in `spec.md`; app-developer view lives only in README + Rustdoc. A guide covering the recurring patterns (sync a subtree, resolve+cache identities, wait for a proposal, message-in-a-directory idiom) would compress the learning curve materially. `msg_spec.md` currently covers only legacy email interop, not app-building.
+Steady-state watch mode is fast — long-lived stream, events delivered without polling. Cold sync (or any burst that fetches many files at once) still pays two structural costs:
 
-## 6. Sync is slow — sources are structural
+1. **`Connection: close` on every request.** `ark/src/client/request.rs:29` adds it unconditionally. Fresh TCP+TLS handshake per call. Fix: pool per (host, port), or at least keep-alive within a single sync pass.
+2. **No batch endpoint for log entries.** Every `.http` entry in the fetched log costs one GET. A `POST /.ark/requests/batch` returning a JSON array would collapse M requests to 1.
 
-`ark-msg` two-account create+sync+send+read loop is ~2s. Underlying costs:
-
-1. **`Connection: close` on every request.** `ark/src/client/request.rs` adds it unconditionally. Fresh TCP+TLS handshake per call. Fix: pool per (host, port), or at least keep-alive within a single sync/accept pass.
-2. **`accept_proposal` round-trips through both servers.** Bob's accept flow: GET from Alice → PUT to own → own server relays back to Alice. Alice already has the file. Fix: recognise a proposal-accept as "materialise a copy locally, no relay needed" — a distinct verb, or `X-Ark-Relay: none` on the internal PUT.
-3. **No batch endpoint for proposals or log entries.** Every `.http` entry costs one GET. A `POST /.ark/requests/batch` returning a JSON array would collapse M requests to 1.
-
-- `ark/src/client/request.rs`, `ark/src/client/proposals.rs`, `ark/src/client/sync.rs`
+- `ark/src/client/request.rs`, `ark/src/client/sync.rs`
 
 ## Nice-to-haves
 

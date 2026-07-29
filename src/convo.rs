@@ -3,7 +3,8 @@ use std::io;
 use std::path::PathBuf;
 
 use ark::client::{put, put_permissions};
-use ark::metadata::{drop, has_metadata_attributes, owner, read_metadata_attributes, reader, writer};
+use ark::metadata::read_metadata_attributes;
+use ark::permissions::{drop, owner, reader, writer};
 use ark::timestamp;
 use ark::types::{IdentityContext, Permission, Permissions};
 use serde::{Deserialize, Serialize};
@@ -70,7 +71,10 @@ pub fn list(ctx: &IdentityContext) -> io::Result<Vec<ConvoSummary>> {
         let path = entry.path();
 
         let title = read_title(&path);
-        let (member_count, owner_count) = count_members(&path).unwrap_or((0, 0));
+        let (member_count, owner_count) = read_metadata_attributes(&path).map(|meta| {
+            let owners = meta.members.iter().filter(|m| m.permission == Permission::Owner).count();
+            (meta.members.len(), owners)
+        }).unwrap_or((0, 0));
         let last_activity = last_activity(ctx, &dir_name);
 
         summaries.push(ConvoSummary { dir_name, title, member_count, owner_count, last_activity });
@@ -139,15 +143,6 @@ pub fn promote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<
 
 pub fn demote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<()> {
     let rel = convo_rel_path(dir_name);
-    if addr == ctx.identity.address {
-        let meta = read_metadata_attributes(&ctx.root.join(&rel))?;
-        let other_owners = meta.members.iter()
-            .filter(|m| m.permission == Permission::Owner && m.address != ctx.identity.address)
-            .count();
-        if other_owners == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot demote self: no other owner"));
-        }
-    }
     put_permissions(ctx, &format!("/{}", rel), &writer(addr))?;
 
     let json_rel = format!("{}/{}", rel, CONVERSATION_JSON);
@@ -157,25 +152,12 @@ pub fn demote(ctx: &IdentityContext, dir_name: &str, addr: &str) -> io::Result<(
     Ok(())
 }
 
-/// Return the writer+owner set of the convo dir (excludes any `*` public
-/// member).
-pub fn members(ctx: &IdentityContext, dir_name: &str) -> io::Result<Vec<String>> {
-    let path = ctx.root.join(convo_rel_path(dir_name));
-    let meta = read_metadata_attributes(&path)?;
-    Ok(meta.members.into_iter()
-        .filter(|m| m.address != "*")
-        .map(|m| m.address)
-        .collect())
-}
-
 fn read_title(dir: &PathBuf) -> Option<String> {
     let bytes = fs::read(dir.join(CONVERSATION_JSON)).ok()?;
     let doc: ConversationDoc = serde_json::from_slice(&bytes).ok()?;
     Some(doc.title)
 }
 
-/// Newest message timestamp in the convo dir, else convo creation time
-/// (ark timestamp prefix on dir_name), else UNIX_EPOCH.
 fn last_activity(ctx: &IdentityContext, dir_name: &str) -> OffsetDateTime {
     if let Ok(mut msgs) = message::list(ctx, dir_name) {
         if let Some(latest) = msgs.pop() {
@@ -187,12 +169,3 @@ fn last_activity(ctx: &IdentityContext, dir_name: &str) -> OffsetDateTime {
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
 }
 
-fn count_members(dir: &PathBuf) -> io::Result<(usize, usize)> {
-    if !has_metadata_attributes(dir)? { return Ok((0, 0)); }
-    let meta = read_metadata_attributes(dir)?;
-    let members = meta.members.iter().filter(|m| m.address != "*").count();
-    let owners = meta.members.iter()
-        .filter(|m| m.address != "*" && m.permission == Permission::Owner)
-        .count();
-    Ok((members, owners))
-}

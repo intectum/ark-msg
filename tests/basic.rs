@@ -140,10 +140,11 @@ fn add_remove_promote_demote() {
     let dir_name = convo::create(&alice, "planning", Some("plan"), &[bob_addr.clone()]).unwrap();
 
     convo::add_member(&alice, &dir_name, &carol_addr).unwrap();
-    let members = convo::members(&alice, &dir_name).unwrap();
-    assert!(members.contains(&alice.identity.address));
-    assert!(members.contains(&bob_addr));
-    assert!(members.contains(&carol_addr));
+    let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/convos/{}", dir_name))).unwrap();
+    let addrs: Vec<&str> = meta.members.iter().map(|m| m.address.as_str()).collect();
+    assert!(addrs.contains(&alice.identity.address.as_str()));
+    assert!(addrs.contains(&bob_addr.as_str()));
+    assert!(addrs.contains(&carol_addr.as_str()));
 
     convo::promote(&alice, &dir_name, &carol_addr).unwrap();
     let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/convos/{}", dir_name))).unwrap();
@@ -160,6 +161,6 @@ fn add_remove_promote_demote() {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
     convo::remove_member(&alice, &dir_name, &bob_addr).unwrap();
-    let members = convo::members(&alice, &dir_name).unwrap();
-    assert!(!members.contains(&bob_addr));
+    let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/convos/{}", dir_name))).unwrap();
+    assert!(!meta.members.iter().any(|m| m.address == bob_addr));
 }
