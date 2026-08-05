@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ark::client::{accept_proposal, init, sync};
+use ark::client::{init, sync};
 use ark::context::create_client_context;
 use ark::server::start_test_server;
 use ark::types::IdentityContext;
 use ark_msg::paths::APPS_MSG;
-use ark_msg::{convo, invite, message};
+use ark_msg::{chat, direct, group, invite, message};
 
 fn sync_msg(ctx: &IdentityContext) {
     let path = ctx.root.join(APPS_MSG);
@@ -65,62 +65,66 @@ fn end_to_end_two_accounts() {
     let bob_addr = format!("bob@127.0.0.1:{}", port);
     let _bob = init_account(&root, "bob", port, "bob");
 
-    // Alice creates a convo with Bob.
+    // Alice creates a chat with Bob.
     env::set_current_dir(root.join("alice")).unwrap();
     let alice = create_client_context().unwrap();
-    let dir_name = convo::create(&alice, "hello", Some("greeting"), &[bob_addr.clone()]).unwrap();
-    assert!(dir_name.ends_with("_greeting"), "dir name should end with slug, got {}", dir_name);
+    let chat_id = direct::create_direct_chat(&alice, Some("hello"), Some("greeting"), &bob_addr).unwrap();
+    assert!(chat_id.starts_with("greeting_"), "chat id should start with slug, got {}", chat_id);
+
+    // Both members own a direct chat, and there is no 'all members' group.
+    let chat_dir = alice.root.join(format!("apps/msg/chats/{}", chat_id));
+    assert!(!chat_dir.join("group.json").exists());
+    let meta = ark::metadata::read_metadata_attributes(&chat_dir).unwrap();
+    for address in [&alice.identity.address, &bob_addr] {
+        let member = meta.members.iter().find(|m| &m.address == address).unwrap();
+        assert_eq!(member.permission, ark::types::Permission::Owner);
+    }
+
+    // Membership is fixed for a direct chat.
+    let err = group::add_group_chat_member(&alice, &chat_id, &format!("carol@127.0.0.1:{}", port)).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 
     // A proposal should arrive on Bob's server.
     let bob_requests = root.join("ark/bob/.ark/requests");
     wait_for(|| bob_requests.exists() && fs::read_dir(&bob_requests).map(|d| d.count() > 0).unwrap_or(false),
              "proposal to land on bob's server");
 
-    // Bob lists invites and accepts the convo share.
+    // Bob lists invites and accepts the chat share.
     env::set_current_dir(root.join("bob")).unwrap();
     let bob = create_client_context().unwrap();
-    let invites = invite::list(&bob).unwrap();
+    let invites = invite::list_invites(&bob).unwrap();
     assert!(!invites.is_empty(), "expected at least one pending invite");
-    let convo_invite = invites.iter().find(|i| i.dir_name == dir_name).expect("invite for created convo");
-    for id in &convo_invite.proposal_ids {
-        accept_proposal(&bob, id, false).unwrap();
-    }
+    let chat_invite = invites.iter().find(|i| i.chat_id == chat_id).expect("invite for created chat");
+    invite::accept_invite(&bob, chat_invite).unwrap();
 
-    // Sync so bob pulls conversation.json (its proposal is written by alice
-    // after the dir is created and must also be accepted).
+    // Sync so bob pulls the chat dir and its contents.
     wait_for(|| {
         sync_msg(&bob);
-        for i in invite::list(&bob).unwrap() {
-            for id in &i.proposal_ids {
-                let _ = accept_proposal(&bob, id, false);
-            }
-        }
-        let convos = convo::list(&bob).unwrap();
-        !convos.is_empty() && convos[0].dir_name == dir_name
-    }, "bob to see the convo locally");
+        let chats = chat::list_chats(&bob).unwrap();
+        !chats.is_empty() && chats[0].id == chat_id
+    }, "bob to see the chat locally");
 
-    let convos = convo::list(&bob).unwrap();
-    assert_eq!(convos.len(), 1);
-    assert_eq!(convos[0].dir_name, dir_name);
+    let chats = chat::list_chats(&bob).unwrap();
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].id, chat_id);
 
     // Alice sends a message.
     env::set_current_dir(root.join("alice")).unwrap();
     let alice = create_client_context().unwrap();
-    message::send(&alice, &dir_name, b"hello bob").unwrap();
+    message::send_message(&alice, &chat_id, b"hello bob").unwrap();
 
     // Bob syncs and reads.
     env::set_current_dir(root.join("bob")).unwrap();
     let bob = create_client_context().unwrap();
     wait_for(|| {
         sync_msg(&bob);
-        message::list(&bob, &dir_name).map(|m| !m.is_empty()).unwrap_or(false)
+        message::list_messages(&bob, &chat_id).map(|m| !m.is_empty()).unwrap_or(false)
     }, "bob to see the message locally");
 
-    let msgs = message::read(&bob, &dir_name, None).unwrap();
+    let msgs = message::read_messages(&bob, &chat_id, None).unwrap();
     assert_eq!(msgs.len(), 1, "expected 1 message");
-    let (summary, body) = &msgs[0];
-    assert_eq!(body, "hello bob");
-    assert_eq!(summary.sender, alice.identity.address);
+    assert_eq!(msgs[0].body, "hello bob");
+    assert_eq!(msgs[0].sender, alice.identity.address);
 }
 
 #[test]
@@ -137,30 +141,115 @@ fn add_remove_promote_demote() {
 
     env::set_current_dir(root.join("alice")).unwrap();
     let alice = create_client_context().unwrap();
-    let dir_name = convo::create(&alice, "planning", Some("plan"), &[bob_addr.clone()]).unwrap();
+    // A group chat with a single member: it can grow, unlike a direct chat.
+    let chat_id = group::create_group_chat(&alice, Some("planning"), Some("plan"), std::slice::from_ref(&bob_addr)).unwrap();
+    let chat_dir = alice.root.join(format!("apps/msg/chats/{}", chat_id));
 
-    convo::add_member(&alice, &dir_name, &carol_addr).unwrap();
-    let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/convos/{}", dir_name))).unwrap();
-    let addrs: Vec<&str> = meta.members.iter().map(|m| m.address.as_str()).collect();
-    assert!(addrs.contains(&alice.identity.address.as_str()));
-    assert!(addrs.contains(&bob_addr.as_str()));
-    assert!(addrs.contains(&carol_addr.as_str()));
+    // Members reach a group chat through the group, so carol gets no direct
+    // entry on the dir.
+    group::add_group_chat_member(&alice, &chat_id, &carol_addr).unwrap();
+    let members = chat::get_chat_members(&alice, &chat_id).unwrap();
+    assert!(members.contains(&alice.identity.address));
+    assert!(members.contains(&bob_addr));
+    assert!(members.contains(&carol_addr));
+    let meta = ark::metadata::read_metadata_attributes(&chat_dir).unwrap();
+    assert!(!meta.members.iter().any(|m| m.address == carol_addr));
 
-    convo::promote(&alice, &dir_name, &carol_addr).unwrap();
-    let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/convos/{}", dir_name))).unwrap();
+    group::promote_group_chat_member(&alice, &chat_id, &carol_addr).unwrap();
+    let meta = ark::metadata::read_metadata_attributes(&chat_dir).unwrap();
     let carol = meta.members.iter().find(|m| m.address == carol_addr).unwrap();
     assert_eq!(carol.permission, ark::types::Permission::Owner);
 
-    convo::demote(&alice, &dir_name, &carol_addr).unwrap();
-    let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/convos/{}", dir_name))).unwrap();
-    let carol = meta.members.iter().find(|m| m.address == carol_addr).unwrap();
-    assert_eq!(carol.permission, ark::types::Permission::Writer);
+    // Demoting drops the direct entry, leaving the group's writer permission.
+    group::demote_group_chat_member(&alice, &chat_id, &carol_addr).unwrap();
+    let meta = ark::metadata::read_metadata_attributes(&chat_dir).unwrap();
+    assert!(!meta.members.iter().any(|m| m.address == carol_addr));
+    assert!(chat::get_chat_members(&alice, &chat_id).unwrap().contains(&carol_addr));
+
+    group::remove_group_chat_member(&alice, &chat_id, &bob_addr).unwrap();
+    assert!(!chat::get_chat_members(&alice, &chat_id).unwrap().contains(&bob_addr));
+
+    // Shrinking to two members keeps the group, so bob can rejoin it.
+    let group_address = ark::identity::read_identity(&chat_dir.join("group.json")).unwrap().address;
+    group::add_group_chat_member(&alice, &chat_id, &bob_addr).unwrap();
+    let group = ark::identity::read_identity(&chat_dir.join("group.json")).unwrap();
+    assert_eq!(group.address, group_address, "the group should be reused");
+    assert!(group.members.unwrap().contains(&bob_addr));
 
     // Cannot demote self while sole owner.
-    let err = convo::demote(&alice, &dir_name, &alice.identity.address).unwrap_err();
+    let err = group::demote_group_chat_member(&alice, &chat_id, &alice.identity.address).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
 
-    convo::remove_member(&alice, &dir_name, &bob_addr).unwrap();
-    let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/convos/{}", dir_name))).unwrap();
-    assert!(!meta.members.iter().any(|m| m.address == bob_addr));
+#[test]
+fn end_to_end_three_accounts() {
+    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, _cleanup) = temp_root("ark_msg_group");
+    let port = start_test_server(root.clone());
+
+    let _alice = init_account(&root, "alice", port, "alice");
+    let bob_addr = format!("bob@127.0.0.1:{}", port);
+    let carol_addr = format!("carol@127.0.0.1:{}", port);
+    let _bob = init_account(&root, "bob", port, "bob");
+    let _carol = init_account(&root, "carol", port, "carol");
+
+    env::set_current_dir(root.join("alice")).unwrap();
+    let alice = create_client_context().unwrap();
+    let chat_id = group::create_group_chat(&alice, Some("team"), Some("team"), &[bob_addr.clone(), carol_addr.clone()]).unwrap();
+
+    // The non-owner permissions go to an 'all members' group holding all three.
+    let group = ark::identity::read_identity(
+        &alice.root.join(format!("apps/msg/chats/{}/group.json", chat_id))).unwrap();
+    let group_members = group.members.clone().unwrap();
+    assert_eq!(group_members.len(), 3);
+    assert!(group_members.contains(&alice.identity.address));
+    let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/chats/{}", chat_id))).unwrap();
+    let group_member = meta.members.iter().find(|m| m.address == group.address).unwrap();
+    assert_eq!(group_member.permission, ark::types::Permission::Writer);
+
+    message::send_message(&alice, &chat_id, b"hello team").unwrap();
+
+    // Both members reach the chat through the group alone.
+    for name in ["bob", "carol"] {
+        env::set_current_dir(root.join(name)).unwrap();
+        let ctx = create_client_context().unwrap();
+        wait_for(|| {
+            join_chats(&ctx);
+            message::read_messages(&ctx, &chat_id, None).map(|m| !m.is_empty()).unwrap_or(false)
+        }, &format!("{} to see the message locally", name));
+
+        let msgs = message::read_messages(&ctx, &chat_id, None).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].body, "hello team");
+        assert_eq!(chat::get_chat_members(&ctx, &chat_id).unwrap().len(), 3);
+
+        // The group's key reaches every member, so each can tell a group chat
+        // from a direct one without resolving anything.
+        assert!(group::is_group_chat(&ctx, &chat_id));
+    }
+
+    // A member with no direct entry can send too.
+    env::set_current_dir(root.join("carol")).unwrap();
+    let carol = create_client_context().unwrap();
+    message::send_message(&carol, &chat_id, b"hi from carol").unwrap();
+
+    env::set_current_dir(root.join("bob")).unwrap();
+    let bob = create_client_context().unwrap();
+    wait_for(|| {
+        join_chats(&bob);
+        message::list_messages(&bob, &chat_id).map(|m| m.len() == 2).unwrap_or(false)
+    }, "bob to see carol's message");
+
+    let msgs = message::read_messages(&bob, &chat_id, None).unwrap();
+    assert_eq!(msgs[1].body, "hi from carol");
+    assert_eq!(msgs[1].sender, carol.identity.address);
+}
+
+/// Sync and accept every pending chat invite.
+fn join_chats(ctx: &IdentityContext) {
+    sync_msg(ctx);
+    for pending in invite::list_invites(ctx).unwrap() {
+        let _ = invite::accept_invite(ctx, &pending);
+    }
+    sync_msg(ctx);
 }

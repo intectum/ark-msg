@@ -1,15 +1,17 @@
+use std::cmp::Reverse;
 use std::io;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use ark::client::{accept_proposal, reject_proposal, sync};
+use ark::client::sync;
 use ark::types::IdentityContext;
 use time::OffsetDateTime;
 
 use crate::paths::APPS_MSG;
-use crate::{convo, invite, message, reltime};
+use crate::types::{Chat, Invite, Message};
+use crate::{chat, invite, message, reltime};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -26,33 +28,33 @@ enum UiEvent {
     Key(crossterm::event::KeyEvent),
     /// Watch stream reported a local/remote change under `apps/msg/`.
     LocalChanged,
-    InvitesLoaded(Vec<invite::InviteSummary>),
+    InvitesLoaded(Vec<Invite>),
     Error(String),
 }
 
-enum Pane { Convos, Input }
+enum Pane { Chats, Input }
 
 enum ListRow {
-    Convo(convo::ConvoSummary),
-    Invite(invite::InviteSummary),
+    Chat(Chat),
+    Invite(Invite),
 }
 
 impl ListRow {
     fn activity(&self) -> OffsetDateTime {
         match self {
-            ListRow::Convo(c) => c.last_activity,
-            ListRow::Invite(i) => i.modified,
+            ListRow::Chat(c) => c.last_activity,
+            ListRow::Invite(i) => i.proposed,
         }
     }
 }
 
 struct App {
     ctx: Arc<IdentityContext>,
-    convos: Vec<convo::ConvoSummary>,
-    invites: Vec<invite::InviteSummary>,
+    chats: Vec<Chat>,
+    invites: Vec<Invite>,
     rows: Vec<ListRow>,
     list_state: ListState,
-    messages: Vec<(message::MessageSummary, String)>,
+    messages: Vec<Message>,
     input: String,
     pane: Pane,
     error: Option<String>,
@@ -66,19 +68,19 @@ impl App {
     fn new(ctx: Arc<IdentityContext>, invite_trigger: Sender<()>) -> Self {
         let mut app = Self {
             ctx,
-            convos: Vec::new(),
+            chats: Vec::new(),
             invites: Vec::new(),
             rows: Vec::new(),
             list_state: ListState::default(),
             messages: Vec::new(),
             input: String::new(),
-            pane: Pane::Convos,
+            pane: Pane::Chats,
             error: None,
             quit: false,
             dirty: false,
             invite_trigger,
         };
-        app.reload_convos();
+        app.reload_chats();
         app.rebuild_rows();
         if !app.rows.is_empty() {
             app.list_state.select(Some(0));
@@ -87,23 +89,23 @@ impl App {
         app
     }
 
-    /// Refresh local convo list (fast, disk-only).
-    fn reload_convos(&mut self) {
-        match convo::list(&self.ctx) {
-            Ok(v) => { self.convos = v; }
+    /// Refresh local chat list (fast, disk-only).
+    fn reload_chats(&mut self) {
+        match chat::list_chats(&self.ctx) {
+            Ok(v) => { self.chats = v; }
             Err(e) => { self.error = Some(format!("list error: {}", e)); }
         }
     }
 
-    /// Combine convos + invites into `rows`, sort desc by activity, preserve
+    /// Combine chats + invites into `rows`, sort desc by activity, preserve
     /// selection by stable row key.
     fn rebuild_rows(&mut self) {
         let prev_key = self.selected_key();
 
-        let mut rows: Vec<ListRow> = Vec::with_capacity(self.convos.len() + self.invites.len());
-        rows.extend(self.convos.iter().cloned().map(ListRow::Convo));
+        let mut rows: Vec<ListRow> = Vec::with_capacity(self.chats.len() + self.invites.len());
+        rows.extend(self.chats.iter().cloned().map(ListRow::Chat));
         rows.extend(self.invites.iter().cloned().map(ListRow::Invite));
-        rows.sort_by(|a, b| b.activity().cmp(&a.activity()));  // most recent first
+        rows.sort_by_key(|row| Reverse(row.activity()));  // most recent first
         self.rows = rows;
 
         let new_idx = prev_key
@@ -113,11 +115,11 @@ impl App {
     }
 
     fn reload_messages(&mut self) {
-        let Some(dir) = self.selected_convo_dir() else {
+        let Some(chat_id) = self.selected_chat_id() else {
             self.messages.clear();
             return;
         };
-        match message::read(&self.ctx, &dir, None) {
+        match message::read_messages(&self.ctx, &chat_id, None) {
             Ok(msgs) => { self.messages = msgs; }
             Err(e) => { self.error = Some(format!("read error: {}", e)); }
         }
@@ -131,17 +133,17 @@ impl App {
         self.selected().map(row_key)
     }
 
-    fn selected_convo_dir(&self) -> Option<String> {
+    fn selected_chat_id(&self) -> Option<String> {
         match self.selected()? {
-            ListRow::Convo(c) => Some(c.dir_name.clone()),
+            ListRow::Chat(c) => Some(c.id.clone()),
             ListRow::Invite(_) => None,
         }
     }
 
-    fn selected_invite(&self) -> Option<invite::InviteSummary> {
+    fn selected_invite(&self) -> Option<Invite> {
         match self.selected()? {
             ListRow::Invite(i) => Some(i.clone()),
-            ListRow::Convo(_) => None,
+            ListRow::Chat(_) => None,
         }
     }
 
@@ -156,8 +158,8 @@ impl App {
     fn send(&mut self) {
         let text = self.input.trim().to_string();
         if text.is_empty() { return; }
-        let Some(dir) = self.selected_convo_dir() else { return; };
-        match message::send(&self.ctx, &dir, text.as_bytes()) {
+        let Some(chat_id) = self.selected_chat_id() else { return; };
+        match message::send_message(&self.ctx, &chat_id, text.as_bytes()) {
             Ok(_) => {
                 self.input.clear();
                 self.error = None;
@@ -169,34 +171,22 @@ impl App {
 
     fn accept_invite(&mut self) {
         let Some(inv) = self.selected_invite() else { return; };
-        let mut errors = 0;
-        for id in &inv.proposal_ids {
-            if let Err(e) = accept_proposal(&self.ctx, id, false) {
-                errors += 1;
-                self.error = Some(format!("accept error: {}", e));
-            }
+        match invite::accept_invite(&self.ctx, &inv) {
+            Ok(()) => { self.error = None; }
+            Err(e) => { self.error = Some(format!("accept error: {}", e)); }
         }
-        if errors == 0 {
-            self.error = None;
-        }
-        self.invites.retain(|i| i.dir_name != inv.dir_name);
+        self.invites.retain(|i| i.chat_id != inv.chat_id);
         self.rebuild_rows();
         self.trigger_invite_refresh();
     }
 
     fn reject_invite(&mut self) {
         let Some(inv) = self.selected_invite() else { return; };
-        let mut errors = 0;
-        for id in &inv.proposal_ids {
-            if let Err(e) = reject_proposal(&self.ctx, id) {
-                errors += 1;
-                self.error = Some(format!("reject error: {}", e));
-            }
+        match invite::reject_invite(&self.ctx, &inv) {
+            Ok(()) => { self.error = None; }
+            Err(e) => { self.error = Some(format!("reject error: {}", e)); }
         }
-        if errors == 0 {
-            self.error = None;
-        }
-        self.invites.retain(|i| i.dir_name != inv.dir_name);
+        self.invites.retain(|i| i.chat_id != inv.chat_id);
         self.rebuild_rows();
         self.reload_messages();
     }
@@ -208,12 +198,12 @@ impl App {
 
 fn row_key(row: &ListRow) -> String {
     match row {
-        ListRow::Convo(c) => format!("c:{}", c.dir_name),
-        ListRow::Invite(i) => format!("i:{}", i.dir_name),
+        ListRow::Chat(c) => format!("c:{}", c.id),
+        ListRow::Invite(i) => format!("i:{}", i.chat_id),
     }
 }
 
-pub fn run(ctx: IdentityContext) -> io::Result<()> {
+pub fn run_tui(ctx: IdentityContext) -> io::Result<()> {
     let ctx = Arc::new(ctx);
 
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
@@ -284,7 +274,7 @@ fn spawn_invite_poller(ctx: Arc<IdentityContext>, ui_tx: Sender<UiEvent>) -> Sen
     let (cmd_tx, cmd_rx) = mpsc::channel::<()>();
     thread::spawn(move || {
         loop {
-            match invite::list(&ctx) {
+            match invite::list_invites(&ctx) {
                 Ok(v) => {
                     if ui_tx.send(UiEvent::InvitesLoaded(v)).is_err() { break; }
                 }
@@ -318,7 +308,7 @@ fn run_loop<B: ratatui::backend::Backend>(
         }
         if app.dirty {
             app.dirty = false;
-            app.reload_convos();
+            app.reload_chats();
             app.rebuild_rows();
             app.reload_messages();
         }
@@ -333,22 +323,22 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
         return;
     }
     match app.pane {
-        Pane::Convos => match key.code {
+        Pane::Chats => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
             KeyCode::Char('j') | KeyCode::Down => app.move_row(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_row(-1),
             KeyCode::Char('a') => app.accept_invite(),
             KeyCode::Char('d') => app.reject_invite(),
             KeyCode::Tab | KeyCode::Enter | KeyCode::Char('i')
-                if app.selected_convo_dir().is_some() =>
+                if app.selected_chat_id().is_some() =>
             {
                 app.pane = Pane::Input;
             }
             _ => {}
         },
         Pane::Input => match key.code {
-            KeyCode::Esc => app.pane = Pane::Convos,
-            KeyCode::Tab => app.pane = Pane::Convos,
+            KeyCode::Esc => app.pane = Pane::Chats,
+            KeyCode::Tab => app.pane = Pane::Chats,
             KeyCode::Enter => app.send(),
             KeyCode::Backspace => { app.input.pop(); }
             KeyCode::Char(c) => app.input.push(c),
@@ -381,20 +371,19 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
 
 fn draw_rows(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app.rows.iter().map(|r| match r {
-        ListRow::Convo(c) => {
-            let title = c.title.as_deref().unwrap_or("(no title)");
-            ListItem::new(format!("{}  ({}m)", title, c.member_count))
+        ListRow::Chat(c) => {
+            ListItem::new(c.name.as_deref().unwrap_or("(no name)").to_string())
         }
         ListRow::Invite(i) => {
             let line = Line::from(vec![
                 Span::styled("[invite] ", Style::default().fg(Color::Yellow)),
-                Span::raw(i.dir_name.clone()),
+                Span::raw(i.chat_id.clone()),
             ]);
             ListItem::new(line)
         }
     }).collect();
-    let focus = matches!(app.pane, Pane::Convos);
-    let block = block("Conversations", focus);
+    let focus = matches!(app.pane, Pane::Chats);
+    let block = block("Chats", focus);
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
@@ -406,7 +395,7 @@ fn draw_rows(f: &mut ratatui::Frame, app: &App, area: Rect) {
 fn draw_detail(f: &mut ratatui::Frame, app: &App, area: Rect) {
     match app.selected() {
         Some(ListRow::Invite(i)) => draw_invite_card(f, i, area),
-        Some(ListRow::Convo(c)) => draw_messages(f, app, c, area),
+        Some(ListRow::Chat(c)) => draw_messages(f, app, c, area),
         None => {
             let para = Paragraph::new("").block(block("Messages", false));
             f.render_widget(para, area);
@@ -414,11 +403,11 @@ fn draw_detail(f: &mut ratatui::Frame, app: &App, area: Rect) {
     }
 }
 
-fn draw_invite_card(f: &mut ratatui::Frame, invite: &invite::InviteSummary, area: Rect) {
+fn draw_invite_card(f: &mut ratatui::Frame, invite: &Invite, area: Rect) {
     let lines = vec![
         Line::from(vec![
-            Span::styled("Convo: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(invite.dir_name.clone()),
+            Span::styled("Chat: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(invite.chat_id.clone()),
         ]),
         Line::from(vec![
             Span::styled("From:  ", Style::default().fg(Color::DarkGray)),
@@ -426,7 +415,7 @@ fn draw_invite_card(f: &mut ratatui::Frame, invite: &invite::InviteSummary, area
         ]),
         Line::from(vec![
             Span::styled("When:  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(reltime::relative(invite.modified)),
+            Span::raw(reltime::relative_time(invite.proposed)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -440,15 +429,15 @@ fn draw_invite_card(f: &mut ratatui::Frame, invite: &invite::InviteSummary, area
     f.render_widget(para, area);
 }
 
-fn draw_messages(f: &mut ratatui::Frame, app: &App, convo: &convo::ConvoSummary, area: Rect) {
-    let title = convo.title.clone().unwrap_or_else(|| convo.dir_name.clone());
-    let lines: Vec<Line> = app.messages.iter().flat_map(|(s, body)| {
+fn draw_messages(f: &mut ratatui::Frame, app: &App, chat: &Chat, area: Rect) {
+    let title = chat.name.clone().unwrap_or_else(|| chat.id.clone());
+    let lines: Vec<Line> = app.messages.iter().flat_map(|message| {
         let head = Line::from(vec![
-            Span::styled(format!("[{}] ", reltime::relative(s.modified)), Style::default().fg(Color::DarkGray)),
-            Span::styled(s.sender.clone(), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("[{}] ", reltime::relative_time(message.sent)), Style::default().fg(Color::DarkGray)),
+            Span::styled(message.sender.clone(), Style::default().fg(Color::Cyan)),
         ]);
         let mut out = vec![head];
-        for l in body.lines() { out.push(Line::from(l.to_string())); }
+        for l in message.body.lines() { out.push(Line::from(l.to_string())); }
         out.push(Line::from(""));
         out
     }).collect();
@@ -490,8 +479,8 @@ fn draw_status(f: &mut ratatui::Frame, app: &App, area: Rect) {
         Span::styled(err.clone(), Style::default().fg(Color::Red))
     } else {
         let hint = match app.pane {
-            Pane::Convos if is_invite => "j/k select  a join  d dismiss  q quit",
-            Pane::Convos => "j/k select  Tab/i input  q quit",
+            Pane::Chats if is_invite => "j/k select  a join  d dismiss  q quit",
+            Pane::Chats => "j/k select  Tab/i input  q quit",
             Pane::Input => "Enter send  Esc/Tab back",
         };
         Span::styled(hint, Style::default().fg(Color::DarkGray))

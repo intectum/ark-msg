@@ -9,7 +9,7 @@ use time::{Duration, OffsetDateTime, UtcOffset, Weekday};
 /// - previous local day: "yesterday HH:MM"
 /// - <7 days: weekday name + local HH:MM
 /// - >=7 days: YYYY-MM-DD
-pub fn relative(ts_utc: OffsetDateTime) -> String {
+pub fn relative_time(ts_utc: OffsetDateTime) -> String {
     let offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
     let ts = ts_utc.to_offset(offset);
     let now = OffsetDateTime::now_utc().to_offset(offset);

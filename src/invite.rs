@@ -1,46 +1,65 @@
-use std::collections::BTreeMap;
 use std::io;
 
-use ark::client::list_proposals;
+use ark::client::{accept_proposal, list_proposals, reject_proposal};
 use ark::types::IdentityContext;
-use time::OffsetDateTime;
 
-use crate::paths::convos_root;
+use crate::paths::chats_root;
+use crate::types::Invite;
 
-#[derive(Clone)]
-pub struct InviteSummary {
-    pub proposal_ids: Vec<String>,
-    pub dir_name: String,
-    pub proposer: String,
-    pub modified: OffsetDateTime,
-}
-
-/// List pending convo invites. Proposals under `apps/msg/convos/<dir>/**`
-/// are grouped by `<dir>` into one invite each.
-pub fn list(ctx: &IdentityContext) -> io::Result<Vec<InviteSummary>> {
-    let marker = format!("/{}/", convos_root());
-    let mut by_dir: BTreeMap<String, InviteSummary> = BTreeMap::new();
+/// List pending chat invites — one per proposal for a chat dir
+/// `apps/msg/chats/<chat_id>`. Proposals for files within a chat dir are not
+/// invites of their own; they are handled along with the dir.
+pub fn list_invites(ctx: &IdentityContext) -> io::Result<Vec<Invite>> {
+    let prefix = format!("/{}/", chats_root());
+    let mut invites = Vec::new();
 
     for proposal in list_proposals(ctx)? {
-        let Some(idx) = proposal.target.find(&marker) else { continue; };
-        let after = &proposal.target[idx + marker.len()..];
-        let dir_name = after.split('/').next().unwrap_or("").to_string();
-        if dir_name.is_empty() { continue; }
+        let Some(index) = proposal.target.find(&prefix) else { continue; };
+        let chat_id = proposal.target[index + prefix.len()..].trim_end_matches('/');
+        if chat_id.is_empty() || chat_id.contains('/') { continue; }
 
-        let modified = proposal.metadata.modified;
-
-        by_dir.entry(dir_name.clone())
-            .and_modify(|inv| {
-                inv.proposal_ids.push(proposal.id.clone());
-                if modified < inv.modified { inv.modified = modified; }
-            })
-            .or_insert_with(|| InviteSummary {
-                proposal_ids: vec![proposal.id.clone()],
-                dir_name,
-                proposer: proposal.metadata.modified_by.clone(),
-                modified,
-            });
+        invites.push(Invite {
+            proposal_id: proposal.id,
+            chat_id: chat_id.to_string(),
+            proposer: proposal.metadata.modified_by,
+            proposed: proposal.metadata.modified,
+        });
     }
 
-    Ok(by_dir.into_values().collect())
+    Ok(invites)
+}
+
+/// Accept an invite: the chat dir, then any pending proposals for files
+/// within it (e.g. `chat.json`, the 'all members' group).
+pub fn accept_invite(ctx: &IdentityContext, invite: &Invite) -> io::Result<()> {
+    accept_proposal(ctx, &invite.proposal_id, false)?;
+
+    for id in list_chat_proposal_ids(ctx, &invite.chat_id)? {
+        accept_proposal(ctx, &id, false)?;
+    }
+
+    Ok(())
+}
+
+/// Reject an invite, along with any pending proposals for files within the
+/// chat dir.
+pub fn reject_invite(ctx: &IdentityContext, invite: &Invite) -> io::Result<()> {
+    reject_proposal(ctx, &invite.proposal_id)?;
+
+    for id in list_chat_proposal_ids(ctx, &invite.chat_id)? {
+        reject_proposal(ctx, &id)?;
+    }
+
+    Ok(())
+}
+
+/// The ids of the pending proposals for files within a chat dir. Call only
+/// once the chat dir's own proposal is gone, or it is included too.
+fn list_chat_proposal_ids(ctx: &IdentityContext, chat_id: &str) -> io::Result<Vec<String>> {
+    let prefix = format!("/{}/{}/", chats_root(), chat_id);
+
+    Ok(list_proposals(ctx)?.into_iter()
+        .filter(|proposal| proposal.target.contains(&prefix))
+        .map(|proposal| proposal.id)
+        .collect())
 }

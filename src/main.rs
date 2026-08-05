@@ -5,8 +5,13 @@ use std::process::ExitCode;
 use ark::client::sync;
 use ark::context::create_client_context;
 use ark::types::IdentityContext;
-use ark_msg::paths::APPS_MSG;
-use ark_msg::{convo, invite, message, reltime, tui};
+use ark_msg::chat::{get_chat_members, list_chats};
+use ark_msg::direct::create_direct_chat;
+use ark_msg::group::{add_group_chat_member, create_group_chat, demote_group_chat_member, promote_group_chat_member, remove_group_chat_member};
+use ark_msg::message::{read_messages, send_message};
+use ark_msg::paths::{chats_root, APPS_MSG};
+use ark_msg::reltime::relative_time;
+use ark_msg::tui::run_tui;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -18,37 +23,59 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a new conversation with the given members.
-    New {
-        #[arg(long)] title: Option<String>,
-        #[arg(long)] slug: Option<String>,
-        #[arg(required = true)] members: Vec<String>,
+    /// Direct chats: a fixed pair, owned by both members.
+    Direct {
+        #[command(subcommand)] cmd: DirectCmd,
     },
-    /// List local conversations.
+    /// Group chats: members can come and go.
+    Group {
+        #[command(subcommand)] cmd: GroupCmd,
+    },
+    /// List local chats.
     List,
+    /// Print messages in a chat.
+    Read {
+        chat: String,
+        #[arg(short = 'n', long)] last: Option<usize>,
+    },
     /// Send a message. Body from positional arg, or `-i FILE`, or stdin.
     Send {
-        convo: String,
+        chat: String,
         #[arg(short = 'i', long)] input: Option<String>,
         body: Option<String>,
     },
-    /// Print messages in a conversation.
-    Read {
-        convo: String,
-        #[arg(short = 'n', long)] last: Option<usize>,
-    },
-    /// Add a writer to a conversation.
-    AddMember { convo: String, addr: String },
-    /// Drop a member from a conversation.
-    RemoveMember { convo: String, addr: String },
-    /// Promote a member to owner.
-    Promote { convo: String, addr: String },
-    /// Demote an owner to writer.
-    Demote { convo: String, addr: String },
-    /// Sync apps/msg/ and auto-accept convo share proposals.
+    /// Sync apps/msg/ and auto-accept chat share proposals.
     Sync,
-    /// Show members of a conversation.
-    Members { convo: String },
+    /// Show members of a chat.
+    Members { chat: String },
+}
+
+#[derive(Subcommand)]
+enum DirectCmd {
+    /// Create a direct chat with the given member.
+    Create {
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] slug: Option<String>,
+        addr: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupCmd {
+    /// Create a group chat with the given members.
+    Create {
+        #[arg(long)] name: Option<String>,
+        #[arg(long)] slug: Option<String>,
+        #[arg(required = true)] members: Vec<String>,
+    },
+    /// Add a member.
+    Add { chat: String, addr: String },
+    /// Drop a member.
+    Remove { chat: String, addr: String },
+    /// Promote a member to owner.
+    Promote { chat: String, addr: String },
+    /// Demote an owner to member.
+    Demote { chat: String, addr: String },
 }
 
 fn main() -> ExitCode {
@@ -59,51 +86,74 @@ fn main() -> ExitCode {
 }
 
 fn run() -> io::Result<()> {
+    let cli = if std::env::args_os().len() > 1 { Some(Cli::parse()) } else { None };
+
     let ctx = create_client_context()?;
     fs::create_dir_all(ctx.root.join(APPS_MSG))?;
-    if std::env::args_os().len() <= 1 {
-        return tui::run(ctx);
-    }
-    let cli = Cli::parse();
+    let cli = match cli {
+        Some(cli) => cli,
+        None => return run_tui(ctx),
+    };
+
     match cli.cmd {
-        Cmd::New { title, slug, members } => cmd_new(&ctx, title, slug, members),
-        Cmd::List => cmd_list(&ctx),
-        Cmd::Send { convo, input, body } => cmd_send(&ctx, convo, input, body),
-        Cmd::Read { convo, last } => cmd_read(&ctx, convo, last),
-        Cmd::AddMember { convo, addr } => cmd_convo_op(&ctx, convo, |c, d| convo::add_member(c, d, &addr), "added"),
-        Cmd::RemoveMember { convo, addr } => cmd_convo_op(&ctx, convo, |c, d| convo::remove_member(c, d, &addr), "removed"),
-        Cmd::Promote { convo, addr } => cmd_convo_op(&ctx, convo, |c, d| convo::promote(c, d, &addr), "promoted"),
-        Cmd::Demote { convo, addr } => cmd_convo_op(&ctx, convo, |c, d| convo::demote(c, d, &addr), "demoted"),
-        Cmd::Sync => cmd_sync(&ctx),
-        Cmd::Members { convo } => cmd_members(&ctx, convo),
+        Cmd::Direct { cmd } => match cmd {
+            DirectCmd::Create { name, slug, addr } =>
+                create_direct_chat(&ctx, name.as_deref(), slug.as_deref(), &addr).map(|_| ()),
+        },
+        Cmd::Group { cmd } => match cmd {
+            GroupCmd::Create { name, slug, members } =>
+                create_group_chat(&ctx, name.as_deref(), slug.as_deref(), &members).map(|_| ()),
+            GroupCmd::Add { chat, addr } =>
+                resolve_chat(&ctx, &chat).and_then(|chat_id| add_group_chat_member(&ctx, &chat_id, &addr)),
+            GroupCmd::Remove { chat, addr } =>
+                resolve_chat(&ctx, &chat).and_then(|chat_id| remove_group_chat_member(&ctx, &chat_id, &addr)),
+            GroupCmd::Promote { chat, addr } =>
+                resolve_chat(&ctx, &chat).and_then(|chat_id| promote_group_chat_member(&ctx, &chat_id, &addr)),
+            GroupCmd::Demote { chat, addr } =>
+                resolve_chat(&ctx, &chat).and_then(|chat_id| demote_group_chat_member(&ctx, &chat_id, &addr)),
+        },
+        Cmd::List => list_chats_cli(&ctx),
+        Cmd::Read { chat, last } =>
+            resolve_chat(&ctx, &chat).and_then(|chat_id| read_messages_cli(&ctx, &chat_id, last)),
+        Cmd::Send { chat, input, body } =>
+            resolve_chat(&ctx, &chat).and_then(|chat_id| send_message_cli(&ctx, &chat_id, input, body)),
+        Cmd::Sync => sync(&ctx, &ctx.root.join(APPS_MSG), false, true, |_| false, |_| false),
+        Cmd::Members { chat } =>
+            resolve_chat(&ctx, &chat).and_then(|chat_id| get_chat_members_cli(&ctx, &chat_id)),
     }
 }
 
-fn cmd_new(ctx: &IdentityContext, title: Option<String>, slug: Option<String>, members: Vec<String>) -> io::Result<()> {
-    let title = title.unwrap_or_else(|| "Untitled".to_string());
-    let dir = convo::create(ctx, &title, slug.as_deref(), &members)?;
-    println!("{}", dir);
-    Ok(())
-}
-
-fn cmd_list(ctx: &IdentityContext) -> io::Result<()> {
-    let convos = convo::list(ctx)?;
-    if convos.is_empty() {
-        println!("(no conversations)");
+fn list_chats_cli(ctx: &IdentityContext) -> io::Result<()> {
+    let chats = list_chats(ctx)?;
+    if chats.is_empty() {
+        println!("(no chats)");
         return Ok(());
     }
-    for c in convos {
-        println!("{}  members={} owners={}  {}",
-            c.dir_name, c.member_count, c.owner_count,
-            c.title.as_deref().unwrap_or("(no title)"));
+
+    for chat in chats {
+        println!("{}  {}", chat.id, chat.name.as_deref().unwrap_or("(no name)"));
     }
+
     Ok(())
 }
 
-fn cmd_send(ctx: &IdentityContext, convo_arg: String, input: Option<String>, body_arg: Option<String>) -> io::Result<()> {
-    let dir = convo::resolve(ctx, &convo_arg)?;
-    let body: Vec<u8> = if let Some(path) = input {
-        fs::read(&path)?
+fn read_messages_cli(ctx: &IdentityContext, chat_id: &str, last: Option<usize>) -> io::Result<()> {
+    let messages = read_messages(ctx, chat_id, last)?;
+
+    let mut stdout = io::stdout().lock();
+    for message in messages {
+        writeln!(stdout, "[{}] {}", relative_time(message.sent), message.sender)?;
+        stdout.write_all(message.body.as_bytes())?;
+        if !message.body.ends_with('\n') { writeln!(stdout)?; }
+        writeln!(stdout)?;
+    }
+
+    Ok(())
+}
+
+fn send_message_cli(ctx: &IdentityContext, chat_id: &str, input: Option<String>, body_arg: Option<String>) -> io::Result<()> {
+    let body: Vec<u8> = if let Some(fs_path) = input {
+        fs::read(&fs_path)?
     } else if let Some(s) = body_arg {
         s.into_bytes()
     } else {
@@ -111,50 +161,41 @@ fn cmd_send(ctx: &IdentityContext, convo_arg: String, input: Option<String>, bod
         io::stdin().read_to_end(&mut buf)?;
         buf
     };
-    let name = message::send(ctx, &dir, &body)?;
-    println!("{}", name);
+
+    send_message(ctx, chat_id, &body)?;
+
     Ok(())
 }
 
-fn cmd_read(ctx: &IdentityContext, convo_arg: String, last: Option<usize>) -> io::Result<()> {
-    let dir = convo::resolve(ctx, &convo_arg)?;
-    let msgs = message::read(ctx, &dir, last)?;
-    let mut stdout = io::stdout().lock();
-    for (summary, body) in msgs {
-        writeln!(stdout, "[{}] {}", reltime::relative(summary.modified), summary.sender)?;
-        stdout.write_all(body.as_bytes())?;
-        if !body.ends_with('\n') { writeln!(stdout)?; }
-        writeln!(stdout)?;
+fn get_chat_members_cli(ctx: &IdentityContext, chat_id: &str) -> io::Result<()> {
+    for address in get_chat_members(ctx, chat_id)? {
+        println!("{}", address);
     }
+
     Ok(())
 }
 
-fn cmd_convo_op(
-    ctx: &IdentityContext,
-    convo_arg: String,
-    op: impl FnOnce(&IdentityContext, &str) -> io::Result<()>,
-    verb: &str,
-) -> io::Result<()> {
-    let dir = convo::resolve(ctx, &convo_arg)?;
-    op(ctx, &dir)?;
-    println!("{} in {}", verb, dir);
-    Ok(())
-}
-
-fn cmd_sync(ctx: &IdentityContext) -> io::Result<()> {
-    sync(ctx, &ctx.root.join(APPS_MSG), false, true, |_| false, |_| false)?;
-    let pending = invite::list(ctx).map(|v| v.len()).unwrap_or(0);
-    if pending > 0 {
-        println!("{} pending invite(s) — use TUI to join or dismiss", pending);
+/// Resolve a caller-provided `<chat>` argument to a full chat id.
+/// Accepts an exact id, or a prefix that matches exactly one chat
+/// (typically the slug portion before the timestamp suffix).
+fn resolve_chat(ctx: &IdentityContext, arg: &str) -> io::Result<String> {
+    let root = ctx.root.join(chats_root());
+    if !root.exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("no chat matches '{}'", arg)));
     }
-    Ok(())
-}
-
-fn cmd_members(ctx: &IdentityContext, convo_arg: String) -> io::Result<()> {
-    let dir = convo::resolve(ctx, &convo_arg)?;
-    let path = ctx.root.join(ark_msg::paths::convo_rel_path(&dir));
-    for m in ark::metadata::read_metadata_attributes(&path)?.members {
-        println!("{}", m.address);
+    let mut exact = None;
+    let mut prefix: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() { continue; }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == arg { exact = Some(name.clone()); }
+        if name.starts_with(arg) { prefix.push(name); }
     }
-    Ok(())
+    if let Some(n) = exact { return Ok(n); }
+    match prefix.len() {
+        1 => Ok(prefix.remove(0)),
+        0 => Err(io::Error::new(io::ErrorKind::NotFound, format!("no chat matches '{}'", arg))),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, format!("ambiguous chat '{}': matches {:?}", arg, prefix))),
+    }
 }
