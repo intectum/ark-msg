@@ -7,6 +7,8 @@ pub struct Chat {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip)]
+    pub other_members: Vec<String>,
     #[serde(skip, default = "OffsetDateTime::now_utc")]
     pub last_activity: OffsetDateTime,
 }

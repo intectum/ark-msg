@@ -5,13 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use ark::client::sync;
-use ark::types::IdentityContext;
 use time::OffsetDateTime;
 
-use crate::paths::APPS_MSG;
+use crate::paths::{APPS_MSG, CHATS_ROOT};
 use crate::types::{Chat, Invite, Message};
-use crate::{chat, invite, message, reltime};
+use crate::{chat, direct, group, invite, message, reltime};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -19,10 +17,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
-
-const INVITE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 enum UiEvent {
     Key(crossterm::event::KeyEvent),
@@ -32,7 +28,17 @@ enum UiEvent {
     Error(String),
 }
 
-enum Pane { Chats, Input }
+enum Pane { Chats, Input, NewChat }
+
+/// A new chat being filled in. A direct chat takes one address and no name —
+/// it falls back to the other member's address.
+struct NewChat {
+    group: bool,
+    members: String,
+    name: String,
+    /// The field being typed into: 0 members, 1 name (group only).
+    field: usize,
+}
 
 enum ListRow {
     Chat(Chat),
@@ -49,7 +55,7 @@ impl ListRow {
 }
 
 struct App {
-    ctx: Arc<IdentityContext>,
+    ctx: Arc<ark::Context>,
     chats: Vec<Chat>,
     invites: Vec<Invite>,
     rows: Vec<ListRow>,
@@ -57,6 +63,7 @@ struct App {
     messages: Vec<Message>,
     input: String,
     pane: Pane,
+    new_chat: Option<NewChat>,
     error: Option<String>,
     quit: bool,
     /// Coalesces bursts of watch events into one reload per redraw tick.
@@ -65,7 +72,7 @@ struct App {
 }
 
 impl App {
-    fn new(ctx: Arc<IdentityContext>, invite_trigger: Sender<()>) -> Self {
+    fn new(ctx: Arc<ark::Context>, invite_trigger: Sender<()>) -> Self {
         let mut app = Self {
             ctx,
             chats: Vec::new(),
@@ -75,6 +82,7 @@ impl App {
             messages: Vec::new(),
             input: String::new(),
             pane: Pane::Chats,
+            new_chat: None,
             error: None,
             quit: false,
             dirty: false,
@@ -169,6 +177,57 @@ impl App {
         }
     }
 
+    fn open_new_chat(&mut self, group: bool) {
+        self.new_chat = Some(NewChat { group, members: String::new(), name: String::new(), field: 0 });
+        self.pane = Pane::NewChat;
+        self.error = None;
+    }
+
+    fn new_chat_field(&mut self) -> &mut String {
+        let new_chat = self.new_chat.as_mut().expect("new chat form");
+        if new_chat.field == 0 { &mut new_chat.members } else { &mut new_chat.name }
+    }
+
+    /// Create the chat being filled in, then select it. A group chat with no
+    /// name is left unnamed; it falls back to its members.
+    fn create_chat(&mut self) {
+        let Some(new_chat) = &self.new_chat else { return; };
+
+        let members: Vec<String> = new_chat.members
+            .split([',', ' '])
+            .filter(|address| !address.is_empty())
+            .map(str::to_string)
+            .collect();
+        let name = new_chat.name.trim();
+        let name = if name.is_empty() { None } else { Some(name) };
+
+        let result = if members.is_empty() {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "an address is required"))
+        } else if new_chat.group {
+            group::create_group_chat(&self.ctx, name, None, &members)
+        } else if members.len() == 1 {
+            direct::create_direct_chat(&self.ctx, None, None, &members[0])
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidInput, "a direct chat takes one address"))
+        };
+
+        match result {
+            Ok(chat_id) => {
+                self.new_chat = None;
+                self.pane = Pane::Chats;
+                self.error = None;
+                self.reload_chats();
+                self.rebuild_rows();
+                let key = format!("c:{}", chat_id);
+                if let Some(index) = self.rows.iter().position(|row| row_key(row) == key) {
+                    self.list_state.select(Some(index));
+                }
+                self.reload_messages();
+            }
+            Err(e) => { self.error = Some(format!("create error: {}", e)); }
+        }
+    }
+
     fn accept_invite(&mut self) {
         let Some(inv) = self.selected_invite() else { return; };
         match invite::accept_invite(&self.ctx, &inv) {
@@ -203,13 +262,14 @@ fn row_key(row: &ListRow) -> String {
     }
 }
 
-pub fn run_tui(ctx: IdentityContext) -> io::Result<()> {
+pub fn run_tui(ctx: ark::Context) -> io::Result<()> {
     let ctx = Arc::new(ctx);
 
     let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>();
     spawn_input_reader(ui_tx.clone());
     spawn_file_watcher(ctx.clone(), ui_tx.clone());
-    let invite_trigger = spawn_invite_poller(ctx.clone(), ui_tx.clone());
+    let invite_trigger = spawn_invite_loader(ctx.clone(), ui_tx.clone());
+    spawn_proposal_watcher(ctx.clone(), ui_tx.clone(), invite_trigger.clone());
 
     let mut app = App::new(ctx, invite_trigger);
 
@@ -246,7 +306,7 @@ fn spawn_input_reader(tx: Sender<UiEvent>) {
 /// reconciled entry; we coalesce into a single `LocalChanged` per event and
 /// let the UI dedup via its `dirty` flag. The watch call blocks until
 /// unrecoverable error, at which point we report status and exit.
-fn spawn_file_watcher(ctx: Arc<IdentityContext>, ui_tx: Sender<UiEvent>) {
+fn spawn_file_watcher(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>) {
     thread::spawn(move || {
         // Both callbacks must be Fn + Send + Sync; wrap Sender in Arc<Mutex<_>>.
         let event_tx = Arc::new(Mutex::new(ui_tx.clone()));
@@ -261,16 +321,40 @@ fn spawn_file_watcher(ctx: Arc<IdentityContext>, ui_tx: Sender<UiEvent>) {
             false
         };
 
-        let path = ctx.root.join(APPS_MSG);
-        if let Err(e) = sync(&ctx, &path, true, true, on_event, on_error) {
+        if let Err(e) = ark::sync(&ctx, APPS_MSG, true, true, on_event, on_error) {
             let _ = ui_tx.send(UiEvent::Error(format!("watch died: {}", e)));
         }
     });
 }
 
-/// Poll invites on interval or on manual trigger. Returns a trigger channel
-/// callers use to wake the poller (e.g. after accept/reject).
-fn spawn_invite_poller(ctx: Arc<IdentityContext>, ui_tx: Sender<UiEvent>) -> Sender<()> {
+/// Reload invites as proposals for chats arrive. Errors reload too: the watch
+/// stream reconnects on its own but drops any proposal logged while it was
+/// down. The watch call blocks until unrecoverable error, at which point we
+/// report status and exit.
+fn spawn_proposal_watcher(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>, invite_trigger: Sender<()>) {
+    thread::spawn(move || {
+        let error_tx = ui_tx.clone();
+        let error_trigger = invite_trigger.clone();
+
+        let on_proposal = move |_proposal| {
+            let _ = invite_trigger.send(());
+            false
+        };
+        let on_error = move |e: io::Error| {
+            let _ = error_tx.send(UiEvent::Error(format!("proposals: {}", e)));
+            let _ = error_trigger.send(());
+            false
+        };
+
+        if let Err(e) = ark::watch_proposals(&ctx, CHATS_ROOT, on_proposal, on_error) {
+            let _ = ui_tx.send(UiEvent::Error(format!("proposal watch died: {}", e)));
+        }
+    });
+}
+
+/// Load invites once, then on every trigger. Returns the trigger channel
+/// callers use to reload (e.g. after accept/reject, or on a new proposal).
+fn spawn_invite_loader(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>) -> Sender<()> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<()>();
     thread::spawn(move || {
         loop {
@@ -282,7 +366,7 @@ fn spawn_invite_poller(ctx: Arc<IdentityContext>, ui_tx: Sender<UiEvent>) -> Sen
                     let _ = ui_tx.send(UiEvent::Error(format!("invite fetch: {}", e)));
                 }
             }
-            let _ = cmd_rx.recv_timeout(INVITE_POLL_INTERVAL);
+            if cmd_rx.recv().is_err() { break; }
         }
     });
     cmd_tx
@@ -329,6 +413,8 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('k') | KeyCode::Up => app.move_row(-1),
             KeyCode::Char('a') => app.accept_invite(),
             KeyCode::Char('d') => app.reject_invite(),
+            KeyCode::Char('n') => app.open_new_chat(false),
+            KeyCode::Char('g') => app.open_new_chat(true),
             KeyCode::Tab | KeyCode::Enter | KeyCode::Char('i')
                 if app.selected_chat_id().is_some() =>
             {
@@ -343,6 +429,23 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Backspace => { app.input.pop(); }
             KeyCode::Char(c) => app.input.push(c),
             _ => {}
+        }
+        Pane::NewChat => {
+            let Some(new_chat) = &app.new_chat else { return; };
+            let (group, field) = (new_chat.group, new_chat.field);
+            match key.code {
+                KeyCode::Esc => {
+                    app.new_chat = None;
+                    app.pane = Pane::Chats;
+                }
+                // Only a group chat has a second field to move to.
+                KeyCode::Tab if group => { app.new_chat.as_mut().unwrap().field = 1 - field; }
+                KeyCode::Enter if group && field == 0 => { app.new_chat.as_mut().unwrap().field = 1; }
+                KeyCode::Enter => app.create_chat(),
+                KeyCode::Backspace => { app.new_chat_field().pop(); }
+                KeyCode::Char(c) => app.new_chat_field().push(c),
+                _ => {}
+            }
         }
     }
 }
@@ -367,13 +470,15 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     draw_detail(f, app, right[0]);
     draw_input(f, app, right[1]);
     draw_status(f, app, chunks[1]);
+
+    if let Some(new_chat) = &app.new_chat {
+        draw_new_chat(f, new_chat, chunks[0]);
+    }
 }
 
 fn draw_rows(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app.rows.iter().map(|r| match r {
-        ListRow::Chat(c) => {
-            ListItem::new(c.name.as_deref().unwrap_or("(no name)").to_string())
-        }
+        ListRow::Chat(c) => ListItem::new(chat::get_chat_display_name(c)),
         ListRow::Invite(i) => {
             let line = Line::from(vec![
                 Span::styled("[invite] ", Style::default().fg(Color::Yellow)),
@@ -430,7 +535,7 @@ fn draw_invite_card(f: &mut ratatui::Frame, invite: &Invite, area: Rect) {
 }
 
 fn draw_messages(f: &mut ratatui::Frame, app: &App, chat: &Chat, area: Rect) {
-    let title = chat.name.clone().unwrap_or_else(|| chat.id.clone());
+    let title = chat::get_chat_display_name(chat);
     let lines: Vec<Line> = app.messages.iter().flat_map(|message| {
         let head = Line::from(vec![
             Span::styled(format!("[{}] ", reltime::relative_time(message.sent)), Style::default().fg(Color::DarkGray)),
@@ -472,16 +577,69 @@ fn draw_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
+fn draw_new_chat(f: &mut ratatui::Frame, new_chat: &NewChat, area: Rect) {
+    let width = area.width.saturating_sub(4).min(64);
+    let height = if new_chat.group { 8 } else { 6 };
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height: height.min(area.height),
+    };
+
+    let mut lines = vec![field_line(
+        if new_chat.group { "Members: " } else { "Address: " },
+        &new_chat.members,
+        new_chat.field == 0,
+    )];
+    if new_chat.group {
+        lines.push(field_line("Name:    ", &new_chat.name, new_chat.field == 1));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if new_chat.group {
+            "Members separated by spaces or commas. Name is optional."
+        } else {
+            "Named after the other account."
+        },
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let title = if new_chat.group { "New Group Chat" } else { "New Direct Chat" };
+    let para = Paragraph::new(lines)
+        .block(block(title, true))
+        .wrap(Wrap { trim: false });
+    f.render_widget(Clear, popup);
+    f.render_widget(para, popup);
+}
+
+fn field_line<'a>(label: &'a str, value: &'a str, focused: bool) -> Line<'a> {
+    let label_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let cursor = if focused { "_" } else { "" };
+
+    Line::from(vec![
+        Span::styled(label, label_style),
+        Span::raw(format!("{}{}", value, cursor)),
+    ])
+}
+
 fn draw_status(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let addr = &app.ctx.identity.address;
     let is_invite = matches!(app.selected(), Some(ListRow::Invite(_)));
     let tail = if let Some(err) = &app.error {
         Span::styled(err.clone(), Style::default().fg(Color::Red))
     } else {
+        let is_group_form = app.new_chat.as_ref().is_some_and(|new_chat| new_chat.group);
         let hint = match app.pane {
-            Pane::Chats if is_invite => "j/k select  a join  d dismiss  q quit",
-            Pane::Chats => "j/k select  Tab/i input  q quit",
+            Pane::Chats if is_invite => "j/k select  a join  d dismiss  n/g new  q quit",
+            Pane::Chats => "j/k select  Tab/i input  n direct  g group  q quit",
             Pane::Input => "Enter send  Esc/Tab back",
+            Pane::NewChat if is_group_form => "Tab field  Enter next/create  Esc cancel",
+            Pane::NewChat => "Enter create  Esc cancel",
         };
         Span::styled(hint, Style::default().fg(Color::DarkGray))
     };

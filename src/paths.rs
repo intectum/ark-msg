@@ -1,19 +1,12 @@
-use std::path::{Path, PathBuf};
+/// The account path of everything the app owns, synced as a whole.
+pub const APPS_MSG: &str = "/apps/msg";
 
-pub const APPS_MSG: &str = "apps/msg";
+/// The account path of the dir holding every chat dir.
+pub const CHATS_ROOT: &str = "/apps/msg/chats";
 
-pub fn chats_root() -> String {
-    format!("{}/chats", APPS_MSG)
-}
-
-/// The chat's ark path, e.g. `/apps/msg/chats/<chat_id>`.
-pub fn get_chat_ark_path(chat_id: &str) -> String {
-    format!("/{}/{}", chats_root(), chat_id)
-}
-
-/// The chat's dir in the local mirror under `root`.
-pub fn get_chat_fs_path(root: &Path, chat_id: &str) -> PathBuf {
-    root.join(chats_root()).join(chat_id)
+/// The chat's account path, e.g. `/apps/msg/chats/<chat_id>`.
+pub fn get_chat_path(chat_id: &str) -> String {
+    format!("{}/{}", CHATS_ROOT, chat_id)
 }
 
 /// Sanitize a caller-provided slug: keep `[a-z0-9-]`, collapse others to `-`,

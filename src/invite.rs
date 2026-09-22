@@ -1,19 +1,16 @@
 use std::io;
 
-use ark::client::{accept_proposal, list_proposals, reject_proposal};
-use ark::types::IdentityContext;
-
-use crate::paths::chats_root;
+use crate::paths::CHATS_ROOT;
 use crate::types::Invite;
 
 /// List pending chat invites — one per proposal for a chat dir
 /// `apps/msg/chats/<chat_id>`. Proposals for files within a chat dir are not
 /// invites of their own; they are handled along with the dir.
-pub fn list_invites(ctx: &IdentityContext) -> io::Result<Vec<Invite>> {
-    let prefix = format!("/{}/", chats_root());
+pub fn list_invites(ctx: &ark::Context) -> io::Result<Vec<Invite>> {
+    let prefix = format!("{}/", CHATS_ROOT);
     let mut invites = Vec::new();
 
-    for proposal in list_proposals(ctx)? {
+    for proposal in ark::list_proposals(ctx)? {
         let Some(index) = proposal.target.find(&prefix) else { continue; };
         let chat_id = proposal.target[index + prefix.len()..].trim_end_matches('/');
         if chat_id.is_empty() || chat_id.contains('/') { continue; }
@@ -31,11 +28,11 @@ pub fn list_invites(ctx: &IdentityContext) -> io::Result<Vec<Invite>> {
 
 /// Accept an invite: the chat dir, then any pending proposals for files
 /// within it (e.g. `chat.json`, the 'all members' group).
-pub fn accept_invite(ctx: &IdentityContext, invite: &Invite) -> io::Result<()> {
-    accept_proposal(ctx, &invite.proposal_id, false)?;
+pub fn accept_invite(ctx: &ark::Context, invite: &Invite) -> io::Result<()> {
+    ark::accept_proposal(ctx, &invite.proposal_id, false)?;
 
     for id in list_chat_proposal_ids(ctx, &invite.chat_id)? {
-        accept_proposal(ctx, &id, false)?;
+        ark::accept_proposal(ctx, &id, false)?;
     }
 
     Ok(())
@@ -43,11 +40,11 @@ pub fn accept_invite(ctx: &IdentityContext, invite: &Invite) -> io::Result<()> {
 
 /// Reject an invite, along with any pending proposals for files within the
 /// chat dir.
-pub fn reject_invite(ctx: &IdentityContext, invite: &Invite) -> io::Result<()> {
-    reject_proposal(ctx, &invite.proposal_id)?;
+pub fn reject_invite(ctx: &ark::Context, invite: &Invite) -> io::Result<()> {
+    ark::reject_proposal(ctx, &invite.proposal_id)?;
 
     for id in list_chat_proposal_ids(ctx, &invite.chat_id)? {
-        reject_proposal(ctx, &id)?;
+        ark::reject_proposal(ctx, &id)?;
     }
 
     Ok(())
@@ -55,10 +52,10 @@ pub fn reject_invite(ctx: &IdentityContext, invite: &Invite) -> io::Result<()> {
 
 /// The ids of the pending proposals for files within a chat dir. Call only
 /// once the chat dir's own proposal is gone, or it is included too.
-fn list_chat_proposal_ids(ctx: &IdentityContext, chat_id: &str) -> io::Result<Vec<String>> {
-    let prefix = format!("/{}/{}/", chats_root(), chat_id);
+fn list_chat_proposal_ids(ctx: &ark::Context, chat_id: &str) -> io::Result<Vec<String>> {
+    let prefix = format!("{}/{}/", CHATS_ROOT, chat_id);
 
-    Ok(list_proposals(ctx)?.into_iter()
+    Ok(ark::list_proposals(ctx)?.into_iter()
         .filter(|proposal| proposal.target.contains(&prefix))
         .map(|proposal| proposal.id)
         .collect())

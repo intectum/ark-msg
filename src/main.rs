@@ -2,14 +2,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use ark::client::sync;
-use ark::context::create_client_context;
-use ark::types::IdentityContext;
-use ark_msg::chat::{get_chat_members, list_chats};
+use ark_msg::chat::{get_chat_display_name, get_chat_members, list_chats};
 use ark_msg::direct::create_direct_chat;
 use ark_msg::group::{add_group_chat_member, create_group_chat, demote_group_chat_member, promote_group_chat_member, remove_group_chat_member};
 use ark_msg::message::{read_messages, send_message};
-use ark_msg::paths::{chats_root, APPS_MSG};
+use ark_msg::paths::{APPS_MSG, CHATS_ROOT};
 use ark_msg::reltime::relative_time;
 use ark_msg::tui::run_tui;
 use clap::{Parser, Subcommand};
@@ -88,8 +85,8 @@ fn main() -> ExitCode {
 fn run() -> io::Result<()> {
     let cli = if std::env::args_os().len() > 1 { Some(Cli::parse()) } else { None };
 
-    let ctx = create_client_context()?;
-    fs::create_dir_all(ctx.root.join(APPS_MSG))?;
+    let ctx = ark::create_client_context()?;
+    ark::create_dir_all(&ctx, APPS_MSG)?;
     let cli = match cli {
         Some(cli) => cli,
         None => return run_tui(ctx),
@@ -117,13 +114,13 @@ fn run() -> io::Result<()> {
             resolve_chat(&ctx, &chat).and_then(|chat_id| read_messages_cli(&ctx, &chat_id, last)),
         Cmd::Send { chat, input, body } =>
             resolve_chat(&ctx, &chat).and_then(|chat_id| send_message_cli(&ctx, &chat_id, input, body)),
-        Cmd::Sync => sync(&ctx, &ctx.root.join(APPS_MSG), false, true, |_| false, |_| false),
+        Cmd::Sync => ark::sync(&ctx, APPS_MSG, false, true, |_| false, |_| false),
         Cmd::Members { chat } =>
             resolve_chat(&ctx, &chat).and_then(|chat_id| get_chat_members_cli(&ctx, &chat_id)),
     }
 }
 
-fn list_chats_cli(ctx: &IdentityContext) -> io::Result<()> {
+fn list_chats_cli(ctx: &ark::Context) -> io::Result<()> {
     let chats = list_chats(ctx)?;
     if chats.is_empty() {
         println!("(no chats)");
@@ -131,13 +128,13 @@ fn list_chats_cli(ctx: &IdentityContext) -> io::Result<()> {
     }
 
     for chat in chats {
-        println!("{}  {}", chat.id, chat.name.as_deref().unwrap_or("(no name)"));
+        println!("{}  {}", chat.id, get_chat_display_name(&chat));
     }
 
     Ok(())
 }
 
-fn read_messages_cli(ctx: &IdentityContext, chat_id: &str, last: Option<usize>) -> io::Result<()> {
+fn read_messages_cli(ctx: &ark::Context, chat_id: &str, last: Option<usize>) -> io::Result<()> {
     let messages = read_messages(ctx, chat_id, last)?;
 
     let mut stdout = io::stdout().lock();
@@ -151,7 +148,7 @@ fn read_messages_cli(ctx: &IdentityContext, chat_id: &str, last: Option<usize>) 
     Ok(())
 }
 
-fn send_message_cli(ctx: &IdentityContext, chat_id: &str, input: Option<String>, body_arg: Option<String>) -> io::Result<()> {
+fn send_message_cli(ctx: &ark::Context, chat_id: &str, input: Option<String>, body_arg: Option<String>) -> io::Result<()> {
     let body: Vec<u8> = if let Some(fs_path) = input {
         fs::read(&fs_path)?
     } else if let Some(s) = body_arg {
@@ -167,7 +164,7 @@ fn send_message_cli(ctx: &IdentityContext, chat_id: &str, input: Option<String>,
     Ok(())
 }
 
-fn get_chat_members_cli(ctx: &IdentityContext, chat_id: &str) -> io::Result<()> {
+fn get_chat_members_cli(ctx: &ark::Context, chat_id: &str) -> io::Result<()> {
     for address in get_chat_members(ctx, chat_id)? {
         println!("{}", address);
     }
@@ -178,17 +175,15 @@ fn get_chat_members_cli(ctx: &IdentityContext, chat_id: &str) -> io::Result<()> 
 /// Resolve a caller-provided `<chat>` argument to a full chat id.
 /// Accepts an exact id, or a prefix that matches exactly one chat
 /// (typically the slug portion before the timestamp suffix).
-fn resolve_chat(ctx: &IdentityContext, arg: &str) -> io::Result<String> {
-    let root = ctx.root.join(chats_root());
-    if !root.exists() {
+fn resolve_chat(ctx: &ark::Context, arg: &str) -> io::Result<String> {
+    if !ark::exists(ctx, CHATS_ROOT) {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("no chat matches '{}'", arg)));
     }
     let mut exact = None;
     let mut prefix: Vec<String> = Vec::new();
-    for entry in fs::read_dir(&root)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() { continue; }
-        let name = entry.file_name().to_string_lossy().into_owned();
+    for path in ark::read_dir(ctx, CHATS_ROOT)? {
+        if !ark::is_dir(ctx, &path) { continue; }
+        let name = ark::file_name(&path).to_string();
         if name == arg { exact = Some(name.clone()); }
         if name.starts_with(arg) { prefix.push(name); }
     }

@@ -4,17 +4,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ark::client::{init, sync};
-use ark::context::create_client_context;
-use ark::server::start_test_server;
-use ark::types::IdentityContext;
 use ark_msg::paths::APPS_MSG;
 use ark_msg::{chat, direct, group, invite, message};
 
-fn sync_msg(ctx: &IdentityContext) {
-    let path = ctx.root.join(APPS_MSG);
-    fs::create_dir_all(&path).unwrap();
-    sync(ctx, &path, false, true, |_| false, |_| false).unwrap();
+fn sync_msg(ctx: &ark::Context) {
+    ark::create_dir_all(ctx, APPS_MSG).unwrap();
+    ark::sync(ctx, APPS_MSG, false, true, |_| false, |_| false).unwrap();
 }
 
 // Shared lock: ark_msg uses cwd for context resolution, so tests within a
@@ -38,12 +33,12 @@ fn temp_root(prefix: &str) -> (PathBuf, Cleanup) {
     (dir, cleanup)
 }
 
-fn init_account(root: &Path, subdir: &str, port: u16, name: &str) -> IdentityContext {
+fn init_account(root: &Path, subdir: &str, port: u16, name: &str) -> ark::Context {
     let dir = root.join(subdir);
     fs::create_dir_all(&dir).unwrap();
     env::set_current_dir(&dir).unwrap();
-    init(&dir, &format!("{}@127.0.0.1:{}", name, port), None, false).unwrap();
-    create_client_context().unwrap()
+    ark::init(&dir, &format!("{}@127.0.0.1:{}", name, port), None, false).unwrap();
+    ark::create_client_context().unwrap()
 }
 
 fn wait_for<F: FnMut() -> bool>(mut cond: F, label: &str) {
@@ -59,7 +54,7 @@ fn wait_for<F: FnMut() -> bool>(mut cond: F, label: &str) {
 fn end_to_end_two_accounts() {
     let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (root, _cleanup) = temp_root("ark_msg_e2e");
-    let port = start_test_server(root.clone());
+    let port = ark::start_test_server(root.clone());
 
     let _alice = init_account(&root, "alice", port, "alice");
     let bob_addr = format!("bob@127.0.0.1:{}", port);
@@ -67,17 +62,17 @@ fn end_to_end_two_accounts() {
 
     // Alice creates a chat with Bob.
     env::set_current_dir(root.join("alice")).unwrap();
-    let alice = create_client_context().unwrap();
+    let alice = ark::create_client_context().unwrap();
     let chat_id = direct::create_direct_chat(&alice, Some("hello"), Some("greeting"), &bob_addr).unwrap();
     assert!(chat_id.starts_with("greeting_"), "chat id should start with slug, got {}", chat_id);
 
     // Both members own a direct chat, and there is no 'all members' group.
-    let chat_dir = alice.root.join(format!("apps/msg/chats/{}", chat_id));
-    assert!(!chat_dir.join("group.json").exists());
-    let meta = ark::metadata::read_metadata_attributes(&chat_dir).unwrap();
+    let chat_path = format!("/apps/msg/chats/{}", chat_id);
+    assert!(!ark::exists(&alice, &format!("{}/group.json", chat_path)));
+    let meta = ark::read_metadata_attributes(&alice, &chat_path).unwrap();
     for address in [&alice.identity.address, &bob_addr] {
         let member = meta.members.iter().find(|m| &m.address == address).unwrap();
-        assert_eq!(member.permission, ark::types::Permission::Owner);
+        assert_eq!(member.permission, ark::Permission::Owner);
     }
 
     // Membership is fixed for a direct chat.
@@ -91,7 +86,7 @@ fn end_to_end_two_accounts() {
 
     // Bob lists invites and accepts the chat share.
     env::set_current_dir(root.join("bob")).unwrap();
-    let bob = create_client_context().unwrap();
+    let bob = ark::create_client_context().unwrap();
     let invites = invite::list_invites(&bob).unwrap();
     assert!(!invites.is_empty(), "expected at least one pending invite");
     let chat_invite = invites.iter().find(|i| i.chat_id == chat_id).expect("invite for created chat");
@@ -110,12 +105,12 @@ fn end_to_end_two_accounts() {
 
     // Alice sends a message.
     env::set_current_dir(root.join("alice")).unwrap();
-    let alice = create_client_context().unwrap();
+    let alice = ark::create_client_context().unwrap();
     message::send_message(&alice, &chat_id, b"hello bob").unwrap();
 
     // Bob syncs and reads.
     env::set_current_dir(root.join("bob")).unwrap();
-    let bob = create_client_context().unwrap();
+    let bob = ark::create_client_context().unwrap();
     wait_for(|| {
         sync_msg(&bob);
         message::list_messages(&bob, &chat_id).map(|m| !m.is_empty()).unwrap_or(false)
@@ -131,7 +126,7 @@ fn end_to_end_two_accounts() {
 fn add_remove_promote_demote() {
     let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (root, _cleanup) = temp_root("ark_msg_membership");
-    let port = start_test_server(root.clone());
+    let port = ark::start_test_server(root.clone());
 
     let _alice = init_account(&root, "alice", port, "alice");
     let bob_addr = format!("bob@127.0.0.1:{}", port);
@@ -140,10 +135,10 @@ fn add_remove_promote_demote() {
     let _carol = init_account(&root, "carol", port, "carol");
 
     env::set_current_dir(root.join("alice")).unwrap();
-    let alice = create_client_context().unwrap();
+    let alice = ark::create_client_context().unwrap();
     // A group chat with a single member: it can grow, unlike a direct chat.
     let chat_id = group::create_group_chat(&alice, Some("planning"), Some("plan"), std::slice::from_ref(&bob_addr)).unwrap();
-    let chat_dir = alice.root.join(format!("apps/msg/chats/{}", chat_id));
+    let chat_path = format!("/apps/msg/chats/{}", chat_id);
 
     // Members reach a group chat through the group, so carol gets no direct
     // entry on the dir.
@@ -152,17 +147,17 @@ fn add_remove_promote_demote() {
     assert!(members.contains(&alice.identity.address));
     assert!(members.contains(&bob_addr));
     assert!(members.contains(&carol_addr));
-    let meta = ark::metadata::read_metadata_attributes(&chat_dir).unwrap();
+    let meta = ark::read_metadata_attributes(&alice, &chat_path).unwrap();
     assert!(!meta.members.iter().any(|m| m.address == carol_addr));
 
     group::promote_group_chat_member(&alice, &chat_id, &carol_addr).unwrap();
-    let meta = ark::metadata::read_metadata_attributes(&chat_dir).unwrap();
+    let meta = ark::read_metadata_attributes(&alice, &chat_path).unwrap();
     let carol = meta.members.iter().find(|m| m.address == carol_addr).unwrap();
-    assert_eq!(carol.permission, ark::types::Permission::Owner);
+    assert_eq!(carol.permission, ark::Permission::Owner);
 
     // Demoting drops the direct entry, leaving the group's writer permission.
     group::demote_group_chat_member(&alice, &chat_id, &carol_addr).unwrap();
-    let meta = ark::metadata::read_metadata_attributes(&chat_dir).unwrap();
+    let meta = ark::read_metadata_attributes(&alice, &chat_path).unwrap();
     assert!(!meta.members.iter().any(|m| m.address == carol_addr));
     assert!(chat::get_chat_members(&alice, &chat_id).unwrap().contains(&carol_addr));
 
@@ -170,9 +165,9 @@ fn add_remove_promote_demote() {
     assert!(!chat::get_chat_members(&alice, &chat_id).unwrap().contains(&bob_addr));
 
     // Shrinking to two members keeps the group, so bob can rejoin it.
-    let group_address = ark::identity::read_identity(&chat_dir.join("group.json")).unwrap().address;
+    let group_address = ark::read_identity(&alice, &format!("{}/group.json", chat_path)).unwrap().address;
     group::add_group_chat_member(&alice, &chat_id, &bob_addr).unwrap();
-    let group = ark::identity::read_identity(&chat_dir.join("group.json")).unwrap();
+    let group = ark::read_identity(&alice, &format!("{}/group.json", chat_path)).unwrap();
     assert_eq!(group.address, group_address, "the group should be reused");
     assert!(group.members.unwrap().contains(&bob_addr));
 
@@ -182,10 +177,10 @@ fn add_remove_promote_demote() {
 }
 
 #[test]
-fn end_to_end_three_accounts() {
+fn display_names_fall_back_to_members() {
     let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let (root, _cleanup) = temp_root("ark_msg_group");
-    let port = start_test_server(root.clone());
+    let (root, _cleanup) = temp_root("ark_msg_names");
+    let port = ark::start_test_server(root.clone());
 
     let _alice = init_account(&root, "alice", port, "alice");
     let bob_addr = format!("bob@127.0.0.1:{}", port);
@@ -194,25 +189,52 @@ fn end_to_end_three_accounts() {
     let _carol = init_account(&root, "carol", port, "carol");
 
     env::set_current_dir(root.join("alice")).unwrap();
-    let alice = create_client_context().unwrap();
+    let alice = ark::create_client_context().unwrap();
+
+    let named = direct::create_direct_chat(&alice, Some("hello"), None, &bob_addr).unwrap();
+    let direct_chat = direct::create_direct_chat(&alice, None, None, &bob_addr).unwrap();
+    let group_chat = group::create_group_chat(&alice, None, None, &[bob_addr.clone(), carol_addr.clone()]).unwrap();
+
+    // A name wins; without one, the other members stand in — self is never
+    // one of them.
+    let display_name = |chat_id: &str| chat::get_chat_display_name(&chat::read_chat(&alice, chat_id));
+    assert_eq!(display_name(&named), "hello");
+    assert_eq!(display_name(&direct_chat), bob_addr);
+    assert_eq!(display_name(&group_chat), format!("{}, {}", bob_addr, carol_addr));
+}
+
+#[test]
+fn end_to_end_three_accounts() {
+    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, _cleanup) = temp_root("ark_msg_group");
+    let port = ark::start_test_server(root.clone());
+
+    let _alice = init_account(&root, "alice", port, "alice");
+    let bob_addr = format!("bob@127.0.0.1:{}", port);
+    let carol_addr = format!("carol@127.0.0.1:{}", port);
+    let _bob = init_account(&root, "bob", port, "bob");
+    let _carol = init_account(&root, "carol", port, "carol");
+
+    env::set_current_dir(root.join("alice")).unwrap();
+    let alice = ark::create_client_context().unwrap();
     let chat_id = group::create_group_chat(&alice, Some("team"), Some("team"), &[bob_addr.clone(), carol_addr.clone()]).unwrap();
 
     // The non-owner permissions go to an 'all members' group holding all three.
-    let group = ark::identity::read_identity(
-        &alice.root.join(format!("apps/msg/chats/{}/group.json", chat_id))).unwrap();
+    let chat_path = format!("/apps/msg/chats/{}", chat_id);
+    let group = ark::read_identity(&alice, &format!("{}/group.json", chat_path)).unwrap();
     let group_members = group.members.clone().unwrap();
     assert_eq!(group_members.len(), 3);
     assert!(group_members.contains(&alice.identity.address));
-    let meta = ark::metadata::read_metadata_attributes(&alice.root.join(format!("apps/msg/chats/{}", chat_id))).unwrap();
+    let meta = ark::read_metadata_attributes(&alice, &chat_path).unwrap();
     let group_member = meta.members.iter().find(|m| m.address == group.address).unwrap();
-    assert_eq!(group_member.permission, ark::types::Permission::Writer);
+    assert_eq!(group_member.permission, ark::Permission::Writer);
 
     message::send_message(&alice, &chat_id, b"hello team").unwrap();
 
     // Both members reach the chat through the group alone.
     for name in ["bob", "carol"] {
         env::set_current_dir(root.join(name)).unwrap();
-        let ctx = create_client_context().unwrap();
+        let ctx = ark::create_client_context().unwrap();
         wait_for(|| {
             join_chats(&ctx);
             message::read_messages(&ctx, &chat_id, None).map(|m| !m.is_empty()).unwrap_or(false)
@@ -230,11 +252,11 @@ fn end_to_end_three_accounts() {
 
     // A member with no direct entry can send too.
     env::set_current_dir(root.join("carol")).unwrap();
-    let carol = create_client_context().unwrap();
+    let carol = ark::create_client_context().unwrap();
     message::send_message(&carol, &chat_id, b"hi from carol").unwrap();
 
     env::set_current_dir(root.join("bob")).unwrap();
-    let bob = create_client_context().unwrap();
+    let bob = ark::create_client_context().unwrap();
     wait_for(|| {
         join_chats(&bob);
         message::list_messages(&bob, &chat_id).map(|m| m.len() == 2).unwrap_or(false)
@@ -246,7 +268,7 @@ fn end_to_end_three_accounts() {
 }
 
 /// Sync and accept every pending chat invite.
-fn join_chats(ctx: &IdentityContext) {
+fn join_chats(ctx: &ark::Context) {
     sync_msg(ctx);
     for pending in invite::list_invites(ctx).unwrap() {
         let _ = invite::accept_invite(ctx, &pending);
