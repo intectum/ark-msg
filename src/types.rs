@@ -14,6 +14,13 @@ pub struct Chat {
 }
 
 #[derive(Clone)]
+pub struct ChatMember {
+    pub address: String,
+    /// Whether they can change the chat's members.
+    pub owner: bool,
+}
+
+#[derive(Clone)]
 pub struct Invite {
     pub proposal_id: String,
     pub chat_id: String,

@@ -41,6 +41,10 @@ fn init_account(root: &Path, subdir: &str, port: u16, name: &str) -> ark::Contex
     ark::create_client_context().unwrap()
 }
 
+fn has_member(members: &[ark_msg::types::ChatMember], address: &str) -> bool {
+    members.iter().any(|member| member.address == address)
+}
+
 fn wait_for<F: FnMut() -> bool>(mut cond: F, label: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -144,9 +148,9 @@ fn add_remove_promote_demote() {
     // entry on the dir.
     group::add_group_chat_member(&alice, &chat_id, &carol_addr).unwrap();
     let members = chat::get_chat_members(&alice, &chat_id).unwrap();
-    assert!(members.contains(&alice.identity.address));
-    assert!(members.contains(&bob_addr));
-    assert!(members.contains(&carol_addr));
+    assert!(has_member(&members, &alice.identity.address));
+    assert!(has_member(&members, &bob_addr));
+    assert!(has_member(&members, &carol_addr));
     let meta = ark::read_metadata_attributes(&alice, &chat_path).unwrap();
     assert!(!meta.members.iter().any(|m| m.address == carol_addr));
 
@@ -155,14 +159,24 @@ fn add_remove_promote_demote() {
     let carol = meta.members.iter().find(|m| m.address == carol_addr).unwrap();
     assert_eq!(carol.permission, ark::Permission::Owner);
 
+    // Owners are marked by their entry on the dir; those reached through the
+    // group are ordinary members.
+    let members = chat::get_chat_members(&alice, &chat_id).unwrap();
+    assert!(members.iter().any(|m| m.address == alice.identity.address && m.owner));
+    assert!(members.iter().any(|m| m.address == carol_addr && m.owner));
+    assert!(members.iter().any(|m| m.address == bob_addr && !m.owner));
+    // The group stands for its members rather than being one of them.
+    assert!(!members.iter().any(|m| m.address.contains("group.json")));
+
     // Demoting drops the direct entry, leaving the group's writer permission.
     group::demote_group_chat_member(&alice, &chat_id, &carol_addr).unwrap();
     let meta = ark::read_metadata_attributes(&alice, &chat_path).unwrap();
     assert!(!meta.members.iter().any(|m| m.address == carol_addr));
-    assert!(chat::get_chat_members(&alice, &chat_id).unwrap().contains(&carol_addr));
+    let members = chat::get_chat_members(&alice, &chat_id).unwrap();
+    assert!(members.iter().any(|m| m.address == carol_addr && !m.owner));
 
     group::remove_group_chat_member(&alice, &chat_id, &bob_addr).unwrap();
-    assert!(!chat::get_chat_members(&alice, &chat_id).unwrap().contains(&bob_addr));
+    assert!(!has_member(&chat::get_chat_members(&alice, &chat_id).unwrap(), &bob_addr));
 
     // Shrinking to two members keeps the group, so bob can rejoin it.
     let group_address = ark::read_identity(&alice, &format!("{}/group.json", chat_path)).unwrap().address;
@@ -248,6 +262,11 @@ fn end_to_end_three_accounts() {
         // The group's key reaches every member, so each can tell a group chat
         // from a direct one without resolving anything.
         assert!(group::is_group_chat(&ctx, &chat_id));
+
+        // The group document reaches them too, rather than being left to a
+        // resolve of its address that caches and goes stale.
+        let group = ark::read_identity(&ctx, &format!("{}/group.json", chat_path)).unwrap();
+        assert_eq!(group.members.unwrap().len(), 3);
     }
 
     // A member with no direct entry can send too.
@@ -265,6 +284,63 @@ fn end_to_end_three_accounts() {
     let msgs = message::read_messages(&bob, &chat_id, None).unwrap();
     assert_eq!(msgs[1].body, "hi from carol");
     assert_eq!(msgs[1].sender, carol.identity.address);
+
+    // A membership change reaches a member's own copy of the group, so their
+    // view of who is in the chat follows the owner's.
+    env::set_current_dir(root.join("alice")).unwrap();
+    group::remove_group_chat_member(&alice, &chat_id, &carol_addr).unwrap();
+
+    env::set_current_dir(root.join("bob")).unwrap();
+    wait_for(|| {
+        join_chats(&bob);
+        ark::read_identity(&bob, &format!("{}/group.json", chat_path)).ok()
+            .and_then(|group| group.members)
+            .is_some_and(|members| !members.contains(&carol_addr))
+    }, "bob to see carol dropped from the group");
+}
+
+/// A promotion changes permissions alone, with no file body behind it. The
+/// watch a running client holds must report that, or the change is not seen
+/// until its next start.
+#[test]
+fn promotion_reaches_a_watching_member() {
+    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, _cleanup) = temp_root("ark_msg_watch");
+    let port = ark::start_test_server(root.clone());
+
+    let _alice = init_account(&root, "alice", port, "alice");
+    let bob_addr = format!("bob@127.0.0.1:{}", port);
+    let _bob = init_account(&root, "bob", port, "bob");
+
+    env::set_current_dir(root.join("alice")).unwrap();
+    let alice = ark::create_client_context().unwrap();
+    let chat_id = group::create_group_chat(&alice, Some("watched"), Some("watched"), std::slice::from_ref(&bob_addr)).unwrap();
+    let chat_path = format!("/apps/msg/chats/{}", chat_id);
+
+    env::set_current_dir(root.join("bob")).unwrap();
+    let bob = ark::create_client_context().unwrap();
+    wait_for(|| {
+        join_chats(&bob);
+        ark::exists(&bob, &chat_path)
+    }, "bob to join the chat");
+
+    // Bob keeps watching, as a running client does.
+    let watching = ark::create_client_context().unwrap();
+    std::thread::spawn(move || {
+        let _ = ark::sync(&watching, APPS_MSG, true, true, |_| false, |_| false);
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    env::set_current_dir(root.join("alice")).unwrap();
+    group::promote_group_chat_member(&alice, &chat_id, &bob_addr).unwrap();
+
+    // No sync call of bob's own: the watch alone has to bring it.
+    wait_for(|| {
+        ark::read_metadata_attributes(&bob, &chat_path)
+            .map(|metadata| metadata.members.iter()
+                .any(|member| member.address == bob_addr && member.permission == ark::Permission::Owner))
+            .unwrap_or(false)
+    }, "bob's watch to see the promotion");
 }
 
 /// Sync and accept every pending chat invite.

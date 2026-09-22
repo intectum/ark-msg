@@ -5,7 +5,7 @@ use time::OffsetDateTime;
 
 use crate::message;
 use crate::paths::{default_slug, get_chat_path, sanitize_slug, CHATS_ROOT};
-use crate::types::Chat;
+use crate::types::{Chat, ChatMember};
 
 /// An id for a new chat: a slug and a timestamp, e.g.
 /// `bob_2026-07-28T13-45-07.123Z`. Also names its dir in the local mirror.
@@ -42,21 +42,34 @@ pub fn read_chat(ctx: &ark::Context, chat_id: &str) -> Chat {
 /// A chat's members but self, from the local mirror alone: the 'all members'
 /// group of a group chat, or the dir's members for a direct chat. Anything
 /// missing or unreadable yields no members.
+///
+/// Best effort, for naming a chat. `group.json` can lag the chat dir while
+/// syncing, so a group chat read before it arrives yields no members.
+/// [`get_chat_members`] resolves those.
 fn read_other_members(ctx: &ark::Context, chat_id: &str) -> Vec<String> {
     let path = get_chat_path(chat_id);
 
     let group_path = format!("{}/group.json", path);
-    let mut members = if ark::exists(ctx, &group_path) {
+    let mut members: Vec<String> = if ark::exists(ctx, &group_path) {
         ark::read_identity(ctx, &group_path).ok().and_then(|group| group.members).unwrap_or_default()
     } else {
         ark::read_metadata_attributes(ctx, &path)
-            .map(|metadata| metadata.members.into_iter().map(|member| member.address).collect())
+            .map(|metadata| metadata.members.into_iter()
+                .filter(|member| !is_group_address(&member.address))
+                .map(|member| member.address)
+                .collect())
             .unwrap_or_default()
     };
 
     members.retain(|address| *address != ctx.identity.address);
 
     members
+}
+
+/// Whether an address is a group's rather than an account's. A group is an
+/// identity at a path, e.g. `bob@host/apps/msg/chats/<chat_id>/group.json`.
+fn is_group_address(address: &str) -> bool {
+    address.contains('/')
 }
 
 /// What to call a chat: its name, or failing that its other members'
@@ -96,19 +109,39 @@ pub fn list_chats(ctx: &ark::Context) -> io::Result<Vec<Chat>> {
     Ok(chats)
 }
 
-/// All member addresses of a chat, with the 'all members' group replaced by
-/// the members it stands for.
-pub fn get_chat_members(ctx: &ark::Context, chat_id: &str) -> io::Result<Vec<String>> {
-    let mut addresses: Vec<String> = Vec::new();
-    for member in ark::read_metadata_attributes(ctx, &get_chat_path(chat_id))?.members {
-        let identity = ark::resolve_identity(ctx, &member.address)?;
-        let member_addresses = identity.members.unwrap_or_else(|| vec![member.address]);
-        for address in member_addresses {
-            if !addresses.contains(&address) {
-                addresses.push(address);
+/// All members of a chat, self included, with the 'all members' group
+/// replaced by the members it stands for. Falls back to resolving a group
+/// whose document has yet to arrive, which reaches its owner's server, so
+/// this is not for the redraw path.
+pub fn get_chat_members(ctx: &ark::Context, chat_id: &str) -> io::Result<Vec<ChatMember>> {
+    let path = get_chat_path(chat_id);
+
+    // The group is shared with the members it names, so it arrives alongside
+    // the chat. Preferred over resolving its address: that answers from a
+    // cache which is never refreshed, and so never sees a membership change.
+    let group = ark::read_identity(ctx, &format!("{}/group.json", path)).ok();
+
+    let mut members: Vec<ChatMember> = Vec::new();
+    for dir_member in ark::read_metadata_attributes(ctx, &path)?.members {
+        // Only a direct entry on the chat dir makes an owner; the group is
+        // held as a writer, so those it stands for are ordinary members.
+        let owner = dir_member.permission == ark::Permission::Owner;
+
+        let addresses = match &group {
+            Some(group) if group.address == dir_member.address =>
+                group.members.clone().unwrap_or_else(|| vec![dir_member.address]),
+            _ => {
+                let identity = ark::resolve_identity(ctx, &dir_member.address)?;
+                identity.members.unwrap_or_else(|| vec![dir_member.address])
+            }
+        };
+        for address in addresses {
+            match members.iter_mut().find(|member| member.address == address) {
+                Some(member) => { member.owner |= owner; }
+                None => members.push(ChatMember { address, owner }),
             }
         }
     }
 
-    Ok(addresses)
+    Ok(members)
 }

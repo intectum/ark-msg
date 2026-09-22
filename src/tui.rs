@@ -8,7 +8,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 use crate::paths::{APPS_MSG, CHATS_ROOT};
-use crate::types::{Chat, Invite, Message};
+use crate::types::{Chat, ChatMember, Invite, Message};
 use crate::{chat, direct, group, invite, message, reltime};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -25,6 +25,7 @@ enum UiEvent {
     /// Watch stream reported a local/remote change under `apps/msg/`.
     LocalChanged,
     InvitesLoaded(Vec<Invite>),
+    MembersLoaded { chat_id: String, members: Vec<ChatMember> },
     ChatCreated(String),
     /// A queued task finished, successfully or not.
     TaskDone,
@@ -39,6 +40,10 @@ enum Task {
     CreateGroup { name: Option<String>, members: Vec<String> },
     Accept(Invite),
     Reject(Invite),
+    AddMember { chat_id: String, address: String },
+    RemoveMember { chat_id: String, address: String },
+    PromoteMember { chat_id: String, address: String },
+    DemoteMember { chat_id: String, address: String },
 }
 
 impl Task {
@@ -48,11 +53,15 @@ impl Task {
             Task::CreateDirect { .. } | Task::CreateGroup { .. } => "create",
             Task::Accept(_) => "accept",
             Task::Reject(_) => "reject",
+            Task::AddMember { .. } => "add",
+            Task::RemoveMember { .. } => "remove",
+            Task::PromoteMember { .. } => "promote",
+            Task::DemoteMember { .. } => "demote",
         }
     }
 }
 
-enum Pane { Chats, Input, NewChat }
+enum Pane { Chats, Input, NewChat, Members }
 
 /// A new chat being filled in. A direct chat takes one address and no name —
 /// it falls back to the other member's address.
@@ -62,6 +71,17 @@ struct NewChat {
     name: String,
     /// The field being typed into: 0 members, 1 name (group only).
     field: usize,
+}
+
+/// The member list of a chat, open over it. Only a group chat's members can
+/// be changed, and only by an owner — a direct chat's pair is fixed.
+struct Members {
+    chat_id: String,
+    group: bool,
+    rows: Vec<ChatMember>,
+    list_state: ListState,
+    /// The address being typed in, while adding a member.
+    adding: Option<String>,
 }
 
 enum ListRow {
@@ -88,6 +108,7 @@ struct App {
     input: String,
     pane: Pane,
     new_chat: Option<NewChat>,
+    members: Option<Members>,
     error: Option<String>,
     quit: bool,
     /// Coalesces bursts of watch events into one reload per redraw tick.
@@ -95,10 +116,11 @@ struct App {
     /// Queued tasks yet to finish, shown in the status line.
     pending: usize,
     task_tx: Sender<Task>,
+    member_trigger: Sender<String>,
 }
 
 impl App {
-    fn new(ctx: Arc<ark::Context>, task_tx: Sender<Task>) -> Self {
+    fn new(ctx: Arc<ark::Context>, task_tx: Sender<Task>, member_trigger: Sender<String>) -> Self {
         let mut app = Self {
             ctx,
             chats: Vec::new(),
@@ -109,11 +131,13 @@ impl App {
             input: String::new(),
             pane: Pane::Chats,
             new_chat: None,
+            members: None,
             error: None,
             quit: false,
             dirty: false,
             pending: 0,
             task_tx,
+            member_trigger,
         };
         app.reload_chats();
         app.rebuild_rows();
@@ -286,6 +310,109 @@ impl App {
         self.error = None;
         self.queue(Task::Reject(invite));
     }
+
+    fn open_members(&mut self) {
+        let Some(chat_id) = self.selected_chat_id() else { return; };
+
+        self.members = Some(Members {
+            group: group::is_group_chat(&self.ctx, &chat_id),
+            chat_id,
+            rows: Vec::new(),
+            list_state: ListState::default(),
+            adding: None,
+        });
+        self.reload_members();
+        self.pane = Pane::Members;
+        self.error = None;
+    }
+
+    fn close_members(&mut self) {
+        self.members = None;
+        self.pane = Pane::Chats;
+    }
+
+    /// Ask for the open chat's members. They arrive as `MembersLoaded`, as
+    /// resolving the 'all members' group can reach its owner's server.
+    fn reload_members(&mut self) {
+        let Some(members) = &self.members else { return; };
+        if self.member_trigger.send(members.chat_id.clone()).is_err() {
+            self.error = Some("members stopped".to_string());
+        }
+    }
+
+    /// Take a loaded member list, keeping the same address selected. A list
+    /// for a chat whose pane has since closed or moved on is dropped.
+    fn members_loaded(&mut self, chat_id: &str, rows: Vec<ChatMember>) {
+        let Some(members) = &mut self.members else { return; };
+        if members.chat_id != chat_id { return; }
+
+        let prev_address = selected_member(members).map(|member| member.address.clone());
+        members.rows = rows;
+
+        let index = prev_address
+            .and_then(|address| members.rows.iter().position(|member| member.address == address))
+            .or(if members.rows.is_empty() { None } else { Some(0) });
+        members.list_state.select(index);
+    }
+
+    fn move_member(&mut self, delta: i32) {
+        let Some(members) = &mut self.members else { return; };
+        if members.rows.is_empty() { return; }
+
+        let cur = members.list_state.selected().unwrap_or(0) as i32;
+        let next = (cur + delta).rem_euclid(members.rows.len() as i32) as usize;
+        members.list_state.select(Some(next));
+    }
+
+    fn member_add_field(&mut self) -> &mut String {
+        self.members.as_mut().expect("member list").adding.as_mut().expect("add field")
+    }
+
+    /// Queue the address typed into the add field.
+    fn add_member(&mut self) {
+        let Some(members) = &self.members else { return; };
+        let address = members.adding.clone().unwrap_or_default().trim().to_string();
+        if address.is_empty() { return; }
+        let chat_id = members.chat_id.clone();
+
+        self.members.as_mut().expect("member list").adding = None;
+        self.error = None;
+        self.queue(Task::AddMember { chat_id, address });
+    }
+
+    /// Queue a drop of the selected member. Leaving a chat yourself is not
+    /// the same thing, so self is not droppable here.
+    fn remove_member(&mut self) {
+        let Some(members) = &self.members else { return; };
+        let Some(member) = selected_member(members) else { return; };
+        if member.address == self.ctx.identity.address {
+            self.error = Some("remove error: cannot remove yourself".to_string());
+            return;
+        }
+        let (chat_id, address) = (members.chat_id.clone(), member.address.clone());
+
+        self.error = None;
+        self.queue(Task::RemoveMember { chat_id, address });
+    }
+
+    /// Queue whichever of promote/demote the selected member's current role
+    /// calls for.
+    fn toggle_member_owner(&mut self) {
+        let Some(members) = &self.members else { return; };
+        let Some(member) = selected_member(members) else { return; };
+        let (chat_id, address) = (members.chat_id.clone(), member.address.clone());
+
+        let task = match member.owner {
+            true => Task::DemoteMember { chat_id, address },
+            false => Task::PromoteMember { chat_id, address },
+        };
+        self.error = None;
+        self.queue(task);
+    }
+}
+
+fn selected_member(members: &Members) -> Option<&ChatMember> {
+    members.list_state.selected().and_then(|index| members.rows.get(index))
 }
 
 fn row_key(row: &ListRow) -> String {
@@ -303,9 +430,10 @@ pub fn run_tui(ctx: ark::Context) -> io::Result<()> {
     spawn_file_watcher(ctx.clone(), ui_tx.clone());
     let invite_trigger = spawn_invite_loader(ctx.clone(), ui_tx.clone());
     spawn_proposal_watcher(ctx.clone(), ui_tx.clone(), invite_trigger.clone());
+    let member_trigger = spawn_member_loader(ctx.clone(), ui_tx.clone());
     let task_tx = spawn_task_runner(ctx.clone(), ui_tx.clone(), invite_trigger);
 
-    let mut app = App::new(ctx, task_tx);
+    let mut app = App::new(ctx, task_tx, member_trigger);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -406,6 +534,27 @@ fn spawn_invite_loader(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>) -> Sender
     cmd_tx
 }
 
+/// Load a chat's members on every trigger. Returns the channel callers send
+/// the chat id on. Kept off the UI thread: the 'all members' group of a chat
+/// this account joined lives on its owner's server, so the first read of one
+/// is a round trip.
+fn spawn_member_loader(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>) -> Sender<String> {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for chat_id in cmd_rx {
+            match chat::get_chat_members(&ctx, &chat_id) {
+                Ok(members) => {
+                    if ui_tx.send(UiEvent::MembersLoaded { chat_id, members }).is_err() { break; }
+                }
+                Err(e) => {
+                    let _ = ui_tx.send(UiEvent::Error(format!("member fetch: {}", e)));
+                }
+            }
+        }
+    });
+    cmd_tx
+}
+
 /// Run queued tasks one at a time, off the UI thread. Returns the channel
 /// the UI queues them on.
 fn spawn_task_runner(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>, invite_trigger: Sender<()>) -> Sender<Task> {
@@ -441,6 +590,10 @@ fn run_task(ctx: &ark::Context, task: Task, ui_tx: &Sender<UiEvent>, invite_trig
             invite::reject_invite(ctx, &invite)?;
             let _ = invite_trigger.send(());
         }
+        Task::AddMember { chat_id, address } => group::add_group_chat_member(ctx, &chat_id, &address)?,
+        Task::RemoveMember { chat_id, address } => group::remove_group_chat_member(ctx, &chat_id, &address)?,
+        Task::PromoteMember { chat_id, address } => group::promote_group_chat_member(ctx, &chat_id, &address)?,
+        Task::DemoteMember { chat_id, address } => group::demote_group_chat_member(ctx, &chat_id, &address)?,
     }
 
     Ok(())
@@ -460,6 +613,7 @@ fn run_loop<B: ratatui::backend::Backend>(
                 app.invites = v;
                 app.rebuild_rows();
             }
+            Ok(UiEvent::MembersLoaded { chat_id, members }) => app.members_loaded(&chat_id, members),
             Ok(UiEvent::ChatCreated(chat_id)) => app.select_chat(&chat_id),
             Ok(UiEvent::TaskDone) => {
                 app.pending = app.pending.saturating_sub(1);
@@ -474,6 +628,7 @@ fn run_loop<B: ratatui::backend::Backend>(
             app.reload_chats();
             app.rebuild_rows();
             app.reload_messages();
+            app.reload_members();
         }
         terminal.draw(|f| ui(f, app))?;
     }
@@ -494,6 +649,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Char('d') => app.reject_invite(),
             KeyCode::Char('n') => app.open_new_chat(false),
             KeyCode::Char('g') => app.open_new_chat(true),
+            KeyCode::Char('m') => app.open_members(),
             KeyCode::Tab | KeyCode::Enter | KeyCode::Char('i')
                 if app.selected_chat_id().is_some() =>
             {
@@ -529,6 +685,35 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 _ => {}
             }
         }
+        Pane::Members => {
+            let Some(members) = &app.members else { return; };
+            let (group, adding) = (members.group, members.adding.is_some());
+
+            // Typing an address takes every key but Esc and Enter, so the
+            // list keys below are out of reach until the field is done with.
+            if adding {
+                match key.code {
+                    KeyCode::Esc => { app.members.as_mut().expect("member list").adding = None; }
+                    KeyCode::Enter => app.add_member(),
+                    KeyCode::Backspace => { app.member_add_field().pop(); }
+                    KeyCode::Char(c) => app.member_add_field().push(c),
+                    _ => {}
+                }
+                return;
+            }
+
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('m') => app.close_members(),
+                KeyCode::Char('j') | KeyCode::Down => app.move_member(1),
+                KeyCode::Char('k') | KeyCode::Up => app.move_member(-1),
+                KeyCode::Char('a') if group => {
+                    app.members.as_mut().expect("member list").adding = Some(String::new());
+                }
+                KeyCode::Char('d') if group => app.remove_member(),
+                KeyCode::Char('p') if group => app.toggle_member_owner(),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -555,6 +740,9 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
 
     if let Some(new_chat) = &app.new_chat {
         draw_new_chat(f, new_chat, chunks[0]);
+    }
+    if app.members.is_some() {
+        draw_members(f, app, chunks[0]);
     }
 }
 
@@ -708,6 +896,61 @@ fn draw_new_chat(f: &mut ratatui::Frame, new_chat: &NewChat, area: Rect) {
     f.render_widget(para, popup);
 }
 
+fn draw_members(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let Some(members) = &app.members else { return; };
+
+    let width = area.width.saturating_sub(4).min(72);
+    let add_height = if members.adding.is_some() { 1 } else { 0 };
+    let height = (members.rows.len() as u16 + 2 + add_height).max(3).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    let title = match app.selected() {
+        Some(ListRow::Chat(chat)) => format!("Members — {}", chat::get_chat_display_name(chat)),
+        _ => "Members".to_string(),
+    };
+    let block = block(&title, true);
+    let inner = block.inner(popup);
+    f.render_widget(Clear, popup);
+    f.render_widget(block, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(add_height)])
+        .split(inner);
+
+    // A chat always has this account as a member, so an empty list is one
+    // still being loaded.
+    if members.rows.is_empty() {
+        let loading = Span::styled("(loading)", Style::default().fg(Color::DarkGray));
+        f.render_widget(Paragraph::new(Line::from(loading)), chunks[0]);
+    } else {
+        let items: Vec<ListItem> = members.rows.iter().map(|member| {
+            let mut spans = vec![Span::raw(member.address.clone())];
+            if member.owner {
+                spans.push(Span::styled("  owner", Style::default().fg(Color::Yellow)));
+            }
+            if member.address == app.ctx.identity.address {
+                spans.push(Span::styled("  (you)", Style::default().fg(Color::DarkGray)));
+            }
+            ListItem::new(Line::from(spans))
+        }).collect();
+        let list = List::new(items)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            .highlight_symbol("> ");
+        let mut state = members.list_state.clone();
+        f.render_stateful_widget(list, chunks[0], &mut state);
+    }
+
+    if let Some(address) = &members.adding {
+        f.render_widget(Paragraph::new(field_line("Add: ", address, true)), chunks[1]);
+    }
+}
+
 fn field_line<'a>(label: &'a str, value: &'a str, focused: bool) -> Line<'a> {
     let label_style = if focused {
         Style::default().fg(Color::Yellow)
@@ -731,12 +974,21 @@ fn draw_status(f: &mut ratatui::Frame, app: &App, area: Rect) {
         Span::styled(format!("working ({})", app.pending), Style::default().fg(Color::Yellow))
     } else {
         let is_group_form = app.new_chat.as_ref().is_some_and(|new_chat| new_chat.group);
+        let members = app.members.as_ref();
+        let is_adding = members.is_some_and(|members| members.adding.is_some());
+        let is_group_members = members.is_some_and(|members| members.group);
+        let owner_selected = members.and_then(selected_member).is_some_and(|member| member.owner);
         let hint = match app.pane {
             Pane::Chats if is_invite => "j/k select  a join  d dismiss  n/g new  q quit",
-            Pane::Chats => "j/k select  Tab/i input  n direct  g group  q quit",
+            Pane::Chats => "j/k select  Tab/i input  n direct  g group  m members  q quit",
             Pane::Input => "Enter send  Up/Down chat  Esc/Tab back",
             Pane::NewChat if is_group_form => "Tab field  Enter next/create  Esc cancel",
             Pane::NewChat => "Enter create  Esc cancel",
+            Pane::Members if is_adding => "Enter add  Esc cancel",
+            Pane::Members if is_group_members && owner_selected =>
+                "j/k select  a add  d remove  p demote  Esc close",
+            Pane::Members if is_group_members => "j/k select  a add  d remove  p promote  Esc close",
+            Pane::Members => "j/k select  Esc close  (direct chat — members are fixed)",
         };
         Span::styled(hint, Style::default().fg(Color::DarkGray))
     };

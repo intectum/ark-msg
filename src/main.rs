@@ -165,8 +165,8 @@ fn send_message_cli(ctx: &ark::Context, chat_id: &str, input: Option<String>, bo
 }
 
 fn get_chat_members_cli(ctx: &ark::Context, chat_id: &str) -> io::Result<()> {
-    for address in get_chat_members(ctx, chat_id)? {
-        println!("{}", address);
+    for member in get_chat_members(ctx, chat_id)? {
+        println!("{}{}", member.address, if member.owner { "  owner" } else { "" });
     }
 
     Ok(())
