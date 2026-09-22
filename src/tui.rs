@@ -25,7 +25,31 @@ enum UiEvent {
     /// Watch stream reported a local/remote change under `apps/msg/`.
     LocalChanged,
     InvitesLoaded(Vec<Invite>),
+    ChatCreated(String),
+    /// A queued task finished, successfully or not.
+    TaskDone,
     Error(String),
+}
+
+/// Work that talks to a server. Queued onto the task thread rather than run
+/// on the UI loop, which a round trip would otherwise stall for seconds.
+enum Task {
+    Send { chat_id: String, body: String },
+    CreateDirect { name: Option<String>, address: String },
+    CreateGroup { name: Option<String>, members: Vec<String> },
+    Accept(Invite),
+    Reject(Invite),
+}
+
+impl Task {
+    fn label(&self) -> &'static str {
+        match self {
+            Task::Send { .. } => "send",
+            Task::CreateDirect { .. } | Task::CreateGroup { .. } => "create",
+            Task::Accept(_) => "accept",
+            Task::Reject(_) => "reject",
+        }
+    }
 }
 
 enum Pane { Chats, Input, NewChat }
@@ -68,11 +92,13 @@ struct App {
     quit: bool,
     /// Coalesces bursts of watch events into one reload per redraw tick.
     dirty: bool,
-    invite_trigger: Sender<()>,
+    /// Queued tasks yet to finish, shown in the status line.
+    pending: usize,
+    task_tx: Sender<Task>,
 }
 
 impl App {
-    fn new(ctx: Arc<ark::Context>, invite_trigger: Sender<()>) -> Self {
+    fn new(ctx: Arc<ark::Context>, task_tx: Sender<Task>) -> Self {
         let mut app = Self {
             ctx,
             chats: Vec::new(),
@@ -86,7 +112,8 @@ impl App {
             error: None,
             quit: false,
             dirty: false,
-            invite_trigger,
+            pending: 0,
+            task_tx,
         };
         app.reload_chats();
         app.rebuild_rows();
@@ -163,17 +190,23 @@ impl App {
         self.reload_messages();
     }
 
+    /// Queue the typed message. It appears once the send lands and the reload
+    /// it triggers picks the new file up.
     fn send(&mut self) {
-        let text = self.input.trim().to_string();
-        if text.is_empty() { return; }
+        let body = self.input.trim().to_string();
+        if body.is_empty() { return; }
         let Some(chat_id) = self.selected_chat_id() else { return; };
-        match message::send_message(&self.ctx, &chat_id, text.as_bytes()) {
-            Ok(_) => {
-                self.input.clear();
-                self.error = None;
-                self.reload_messages();
-            }
-            Err(e) => { self.error = Some(format!("send error: {}", e)); }
+
+        self.input.clear();
+        self.error = None;
+        self.queue(Task::Send { chat_id, body });
+    }
+
+    fn queue(&mut self, task: Task) {
+        self.pending += 1;
+        if self.task_tx.send(task).is_err() {
+            self.pending -= 1;
+            self.error = Some("tasks stopped".to_string());
         }
     }
 
@@ -188,70 +221,70 @@ impl App {
         if new_chat.field == 0 { &mut new_chat.members } else { &mut new_chat.name }
     }
 
-    /// Create the chat being filled in, then select it. A group chat with no
-    /// name is left unnamed; it falls back to its members.
+    /// Queue the chat being filled in. It is selected once created. A group
+    /// chat with no name is left unnamed; it falls back to its members.
     fn create_chat(&mut self) {
         let Some(new_chat) = &self.new_chat else { return; };
 
+        let group = new_chat.group;
         let members: Vec<String> = new_chat.members
             .split([',', ' '])
             .filter(|address| !address.is_empty())
             .map(str::to_string)
             .collect();
         let name = new_chat.name.trim();
-        let name = if name.is_empty() { None } else { Some(name) };
+        let name = if name.is_empty() { None } else { Some(name.to_string()) };
 
-        let result = if members.is_empty() {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "an address is required"))
-        } else if new_chat.group {
-            group::create_group_chat(&self.ctx, name, None, &members)
+        let task = if members.is_empty() {
+            self.error = Some("create error: an address is required".to_string());
+            return;
+        } else if group {
+            Task::CreateGroup { name, members }
         } else if members.len() == 1 {
-            direct::create_direct_chat(&self.ctx, None, None, &members[0])
+            Task::CreateDirect { name: None, address: members[0].clone() }
         } else {
-            Err(io::Error::new(io::ErrorKind::InvalidInput, "a direct chat takes one address"))
+            self.error = Some("create error: a direct chat takes one address".to_string());
+            return;
         };
 
-        match result {
-            Ok(chat_id) => {
-                self.new_chat = None;
-                self.pane = Pane::Chats;
-                self.error = None;
-                self.reload_chats();
-                self.rebuild_rows();
-                let key = format!("c:{}", chat_id);
-                if let Some(index) = self.rows.iter().position(|row| row_key(row) == key) {
-                    self.list_state.select(Some(index));
-                }
-                self.reload_messages();
-            }
-            Err(e) => { self.error = Some(format!("create error: {}", e)); }
-        }
+        self.new_chat = None;
+        self.pane = Pane::Chats;
+        self.error = None;
+        self.queue(task);
     }
 
-    fn accept_invite(&mut self) {
-        let Some(inv) = self.selected_invite() else { return; };
-        match invite::accept_invite(&self.ctx, &inv) {
-            Ok(()) => { self.error = None; }
-            Err(e) => { self.error = Some(format!("accept error: {}", e)); }
-        }
-        self.invites.retain(|i| i.chat_id != inv.chat_id);
+    /// Select a chat by id, once it is in the local mirror.
+    fn select_chat(&mut self, chat_id: &str) {
+        self.reload_chats();
         self.rebuild_rows();
-        self.trigger_invite_refresh();
-    }
 
-    fn reject_invite(&mut self) {
-        let Some(inv) = self.selected_invite() else { return; };
-        match invite::reject_invite(&self.ctx, &inv) {
-            Ok(()) => { self.error = None; }
-            Err(e) => { self.error = Some(format!("reject error: {}", e)); }
+        let key = format!("c:{}", chat_id);
+        if let Some(index) = self.rows.iter().position(|row| row_key(row) == key) {
+            self.list_state.select(Some(index));
         }
-        self.invites.retain(|i| i.chat_id != inv.chat_id);
-        self.rebuild_rows();
+
         self.reload_messages();
     }
 
-    fn trigger_invite_refresh(&self) {
-        let _ = self.invite_trigger.send(());
+    fn accept_invite(&mut self) {
+        let Some(invite) = self.selected_invite() else { return; };
+
+        // Dropped up front: the row goes as the invite is queued, rather than
+        // lingering until the accept lands.
+        self.invites.retain(|i| i.chat_id != invite.chat_id);
+        self.rebuild_rows();
+        self.error = None;
+        self.queue(Task::Accept(invite));
+    }
+
+    fn reject_invite(&mut self) {
+        let Some(invite) = self.selected_invite() else { return; };
+
+        self.invites.retain(|i| i.chat_id != invite.chat_id);
+        self.rebuild_rows();
+        self.reload_messages();
+        self.error = None;
+        self.queue(Task::Reject(invite));
     }
 }
 
@@ -270,8 +303,9 @@ pub fn run_tui(ctx: ark::Context) -> io::Result<()> {
     spawn_file_watcher(ctx.clone(), ui_tx.clone());
     let invite_trigger = spawn_invite_loader(ctx.clone(), ui_tx.clone());
     spawn_proposal_watcher(ctx.clone(), ui_tx.clone(), invite_trigger.clone());
+    let task_tx = spawn_task_runner(ctx.clone(), ui_tx.clone(), invite_trigger);
 
-    let mut app = App::new(ctx, invite_trigger);
+    let mut app = App::new(ctx, task_tx);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -372,6 +406,46 @@ fn spawn_invite_loader(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>) -> Sender
     cmd_tx
 }
 
+/// Run queued tasks one at a time, off the UI thread. Returns the channel
+/// the UI queues them on.
+fn spawn_task_runner(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>, invite_trigger: Sender<()>) -> Sender<Task> {
+    let (task_tx, task_rx) = mpsc::channel::<Task>();
+    thread::spawn(move || {
+        for task in task_rx {
+            let label = task.label();
+            if let Err(e) = run_task(&ctx, task, &ui_tx, &invite_trigger) {
+                let _ = ui_tx.send(UiEvent::Error(format!("{} error: {}", label, e)));
+            }
+            if ui_tx.send(UiEvent::TaskDone).is_err() { break; }
+        }
+    });
+    task_tx
+}
+
+fn run_task(ctx: &ark::Context, task: Task, ui_tx: &Sender<UiEvent>, invite_trigger: &Sender<()>) -> io::Result<()> {
+    match task {
+        Task::Send { chat_id, body } => { message::send_message(ctx, &chat_id, body.as_bytes())?; }
+        Task::CreateDirect { name, address } => {
+            let chat_id = direct::create_direct_chat(ctx, name.as_deref(), None, &address)?;
+            let _ = ui_tx.send(UiEvent::ChatCreated(chat_id));
+        }
+        Task::CreateGroup { name, members } => {
+            let chat_id = group::create_group_chat(ctx, name.as_deref(), None, &members)?;
+            let _ = ui_tx.send(UiEvent::ChatCreated(chat_id));
+        }
+        Task::Accept(invite) => {
+            invite::accept_invite(ctx, &invite)?;
+            let _ = invite_trigger.send(());
+        }
+        Task::Reject(invite) => {
+            invite::reject_invite(ctx, &invite)?;
+            let _ = invite_trigger.send(());
+        }
+    }
+
+    Ok(())
+}
+
 fn run_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -385,6 +459,11 @@ fn run_loop<B: ratatui::backend::Backend>(
             Ok(UiEvent::InvitesLoaded(v)) => {
                 app.invites = v;
                 app.rebuild_rows();
+            }
+            Ok(UiEvent::ChatCreated(chat_id)) => app.select_chat(&chat_id),
+            Ok(UiEvent::TaskDone) => {
+                app.pending = app.pending.saturating_sub(1);
+                app.dirty = true;
             }
             Ok(UiEvent::Error(s)) => { app.error = Some(s); }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -426,6 +505,9 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) {
             KeyCode::Esc => app.pane = Pane::Chats,
             KeyCode::Tab => app.pane = Pane::Chats,
             KeyCode::Enter => app.send(),
+            // The arrows move between chats from either pane; j/k are text here.
+            KeyCode::Down => app.move_row(1),
+            KeyCode::Up => app.move_row(-1),
             KeyCode::Backspace => { app.input.pop(); }
             KeyCode::Char(c) => app.input.push(c),
             _ => {}
@@ -488,10 +570,16 @@ fn draw_rows(f: &mut ratatui::Frame, app: &App, area: Rect) {
         }
     }).collect();
     let focus = matches!(app.pane, Pane::Chats);
-    let block = block("Chats", focus);
+    // Dimmed while typing: the selection still marks the chat being read, but
+    // the keys are going to the message box.
+    let highlight_style = match focus {
+        true => Style::default().add_modifier(Modifier::REVERSED),
+        false => Style::default().add_modifier(Modifier::REVERSED | Modifier::DIM),
+    };
     let list = List::new(items)
-        .block(block)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(block("Chats", focus))
+        .style(if focus { Style::default() } else { Style::default().add_modifier(Modifier::DIM) })
+        .highlight_style(highlight_style)
         .highlight_symbol("> ");
     let mut state = app.list_state.clone();
     f.render_stateful_widget(list, area, &mut state);
@@ -575,6 +663,13 @@ fn draw_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let para = Paragraph::new(Line::from(Span::styled(text, style)))
         .block(block("Message", focus));
     f.render_widget(para, area);
+
+    if focus {
+        // Inside the border, at the end of what has been typed.
+        let last_column = area.x + area.width.saturating_sub(2);
+        let column = (area.x + 1 + app.input.chars().count() as u16).min(last_column);
+        f.set_cursor_position((column, area.y + 1));
+    }
 }
 
 fn draw_new_chat(f: &mut ratatui::Frame, new_chat: &NewChat, area: Rect) {
@@ -632,12 +727,14 @@ fn draw_status(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let is_invite = matches!(app.selected(), Some(ListRow::Invite(_)));
     let tail = if let Some(err) = &app.error {
         Span::styled(err.clone(), Style::default().fg(Color::Red))
+    } else if app.pending > 0 {
+        Span::styled(format!("working ({})", app.pending), Style::default().fg(Color::Yellow))
     } else {
         let is_group_form = app.new_chat.as_ref().is_some_and(|new_chat| new_chat.group);
         let hint = match app.pane {
             Pane::Chats if is_invite => "j/k select  a join  d dismiss  n/g new  q quit",
             Pane::Chats => "j/k select  Tab/i input  n direct  g group  q quit",
-            Pane::Input => "Enter send  Esc/Tab back",
+            Pane::Input => "Enter send  Up/Down chat  Esc/Tab back",
             Pane::NewChat if is_group_form => "Tab field  Enter next/create  Esc cancel",
             Pane::NewChat => "Enter create  Esc cancel",
         };
