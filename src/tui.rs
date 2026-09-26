@@ -25,7 +25,8 @@ enum UiEvent {
     /// Watch stream reported a local/remote change under `apps/msg/`.
     LocalChanged,
     InvitesLoaded(Vec<Invite>),
-    MembersLoaded { chat_id: String, members: Vec<ChatMember> },
+    /// A chat's members, with whether this account is still one of them.
+    MembersLoaded { chat_id: String, members: Vec<ChatMember>, removed: bool },
     ChatCreated(String),
     /// A queued task finished, successfully or not.
     TaskDone,
@@ -60,6 +61,9 @@ impl Task {
         }
     }
 }
+
+/// How often the selected chat's membership is re-asked of its owner.
+const MEMBERSHIP_POLL: Duration = Duration::from_secs(10);
 
 enum Pane { Chats, Input, NewChat, Members }
 
@@ -109,6 +113,9 @@ struct App {
     pane: Pane,
     new_chat: Option<NewChat>,
     members: Option<Members>,
+    /// Chats this account has been removed from, as their owners last
+    /// answered. Only the selected chat is ever asked.
+    removed_chats: Vec<String>,
     error: Option<String>,
     quit: bool,
     /// Coalesces bursts of watch events into one reload per redraw tick.
@@ -132,6 +139,7 @@ impl App {
             pane: Pane::Chats,
             new_chat: None,
             members: None,
+            removed_chats: Vec::new(),
             error: None,
             quit: false,
             dirty: false,
@@ -144,6 +152,7 @@ impl App {
         if !app.rows.is_empty() {
             app.list_state.select(Some(0));
             app.reload_messages();
+            app.reload_members();
         }
         app
     }
@@ -212,6 +221,7 @@ impl App {
         let next = (cur + delta).rem_euclid(self.rows.len() as i32) as usize;
         self.list_state.select(Some(next));
         self.reload_messages();
+        self.reload_members();
     }
 
     /// Queue the typed message. It appears once the send lands and the reload
@@ -220,6 +230,12 @@ impl App {
         let body = self.input.trim().to_string();
         if body.is_empty() { return; }
         let Some(chat_id) = self.selected_chat_id() else { return; };
+        if self.removed(&chat_id) {
+            // The send would land locally and reach nobody: the chat's members
+            // no longer include this account.
+            self.error = Some("send error: you are no longer a member".to_string());
+            return;
+        }
 
         self.input.clear();
         self.error = None;
@@ -288,6 +304,7 @@ impl App {
         }
 
         self.reload_messages();
+        self.reload_members();
     }
 
     fn accept_invite(&mut self) {
@@ -331,13 +348,26 @@ impl App {
         self.pane = Pane::Chats;
     }
 
-    /// Ask for the open chat's members. They arrive as `MembersLoaded`, as
-    /// resolving the 'all members' group can reach its owner's server.
+    /// Ask for the selected chat's members and whether this account is still
+    /// one of them. They arrive as `MembersLoaded`, off the UI thread: both
+    /// answers can reach the chat owner's server.
     fn reload_members(&mut self) {
-        let Some(members) = &self.members else { return; };
-        if self.member_trigger.send(members.chat_id.clone()).is_err() {
+        // An empty id stops the polling: no chat is selected to ask about.
+        if self.member_trigger.send(self.selected_chat_id().unwrap_or_default()).is_err() {
             self.error = Some("members stopped".to_string());
         }
+    }
+
+    /// Take the answer to whether this account is still a member of a chat.
+    fn membership_loaded(&mut self, chat_id: &str, removed: bool) {
+        self.removed_chats.retain(|id| id != chat_id);
+        if removed {
+            self.removed_chats.push(chat_id.to_string());
+        }
+    }
+
+    fn removed(&self, chat_id: &str) -> bool {
+        self.removed_chats.iter().any(|id| id == chat_id)
     }
 
     /// Take a loaded member list, keeping the same address selected. A list
@@ -534,17 +564,30 @@ fn spawn_invite_loader(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>) -> Sender
     cmd_tx
 }
 
-/// Load a chat's members on every trigger. Returns the channel callers send
-/// the chat id on. Kept off the UI thread: the 'all members' group of a chat
-/// this account joined lives on its owner's server, so the first read of one
-/// is a round trip.
+/// Load a chat's members on every trigger, and every [`MEMBERSHIP_POLL`] in
+/// between. Returns the channel callers send the chat id on. Kept off the UI
+/// thread: the 'all members' group of a chat this account joined lives on its
+/// owner's server, so the first read of one is a round trip.
+///
+/// Polled rather than triggered alone because a removal reaches no watch:
+/// the account it drops is no longer relayed to, so the answer only changes
+/// on the owner's server.
 fn spawn_member_loader(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>) -> Sender<String> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
     thread::spawn(move || {
-        for chat_id in cmd_rx {
-            match chat::get_chat_members(&ctx, &chat_id) {
-                Ok(members) => {
-                    if ui_tx.send(UiEvent::MembersLoaded { chat_id, members }).is_err() { break; }
+        let mut chat_id = String::new();
+        loop {
+            match cmd_rx.recv_timeout(MEMBERSHIP_POLL) {
+                Ok(next) => { chat_id = next; }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if chat_id.is_empty() { continue; }
+
+            match load_members(&ctx, &chat_id) {
+                Ok((members, removed)) => {
+                    let loaded = UiEvent::MembersLoaded { chat_id: chat_id.clone(), members, removed };
+                    if ui_tx.send(loaded).is_err() { break; }
                 }
                 Err(e) => {
                     let _ = ui_tx.send(UiEvent::Error(format!("member fetch: {}", e)));
@@ -553,6 +596,19 @@ fn spawn_member_loader(ctx: Arc<ark::Context>, ui_tx: Sender<UiEvent>) -> Sender
         }
     });
     cmd_tx
+}
+
+/// A chat's members, and whether this account is still one of them. A removed
+/// account is dropped from the list: its mirror never hears of the removal, so
+/// the list it holds still carries it.
+fn load_members(ctx: &ark::Context, chat_id: &str) -> io::Result<(Vec<ChatMember>, bool)> {
+    let mut members = chat::get_chat_members(ctx, chat_id)?;
+    let removed = !chat::is_chat_member(ctx, chat_id)?;
+    if removed {
+        members.retain(|member| member.address != ctx.identity.address);
+    }
+
+    Ok((members, removed))
 }
 
 /// Run queued tasks one at a time, off the UI thread. Returns the channel
@@ -613,7 +669,10 @@ fn run_loop<B: ratatui::backend::Backend>(
                 app.invites = v;
                 app.rebuild_rows();
             }
-            Ok(UiEvent::MembersLoaded { chat_id, members }) => app.members_loaded(&chat_id, members),
+            Ok(UiEvent::MembersLoaded { chat_id, members, removed }) => {
+                app.membership_loaded(&chat_id, removed);
+                app.members_loaded(&chat_id, members);
+            }
             Ok(UiEvent::ChatCreated(chat_id)) => app.select_chat(&chat_id),
             Ok(UiEvent::TaskDone) => {
                 app.pending = app.pending.saturating_sub(1);
@@ -812,7 +871,7 @@ fn draw_invite_card(f: &mut ratatui::Frame, invite: &Invite, area: Rect) {
 
 fn draw_messages(f: &mut ratatui::Frame, app: &App, chat: &Chat, area: Rect) {
     let title = chat::get_chat_display_name(chat);
-    let lines: Vec<Line> = app.messages.iter().flat_map(|message| {
+    let mut lines: Vec<Line> = app.messages.iter().flat_map(|message| {
         let head = Line::from(vec![
             Span::styled(format!("[{}] ", reltime::relative_time(message.sent)), Style::default().fg(Color::DarkGray)),
             Span::styled(message.sender.clone(), Style::default().fg(Color::Cyan)),
@@ -822,6 +881,15 @@ fn draw_messages(f: &mut ratatui::Frame, app: &App, chat: &Chat, area: Rect) {
         out.push(Line::from(""));
         out
     }).collect();
+
+    // Last, where the next message would have been: this is where the chat
+    // ended for this account.
+    if app.removed(&chat.id) {
+        lines.push(Line::from(Span::styled(
+            "— you were removed from this chat —",
+            Style::default().fg(Color::Red),
+        )));
+    }
 
     let msg_count = app.messages.len();
     let visible = area.height.saturating_sub(2) as usize;
@@ -839,9 +907,13 @@ fn draw_messages(f: &mut ratatui::Frame, app: &App, chat: &Chat, area: Rect) {
 fn draw_input(f: &mut ratatui::Frame, app: &App, area: Rect) {
     let focus = matches!(app.pane, Pane::Input);
     let is_invite = matches!(app.selected(), Some(ListRow::Invite(_)));
+    let removed = app.selected_chat_id().is_some_and(|chat_id| app.removed(&chat_id));
     let (text, style) = if is_invite {
         ("(invite selected — press a to join)".to_string(),
          Style::default().fg(Color::DarkGray))
+    } else if removed && app.input.is_empty() {
+        ("(you were removed — nothing sent from here arrives)".to_string(),
+         Style::default().fg(Color::Red))
     } else if app.input.is_empty() && !focus {
         ("(press Tab or i to type, Enter to send)".to_string(),
          Style::default().fg(Color::DarkGray))

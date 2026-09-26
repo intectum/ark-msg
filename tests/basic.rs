@@ -351,3 +351,41 @@ fn join_chats(ctx: &ark::Context) {
     }
     sync_msg(ctx);
 }
+
+#[test]
+fn removal_is_visible_to_the_removed_member() {
+    let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, _cleanup) = temp_root("ark_msg_removal");
+    let port = ark::start_test_server(root.clone());
+
+    let _alice = init_account(&root, "alice", port, "alice");
+    let bob_addr = format!("bob@127.0.0.1:{}", port);
+    let _bob = init_account(&root, "bob", port, "bob");
+
+    env::set_current_dir(root.join("alice")).unwrap();
+    let alice = ark::create_client_context().unwrap();
+    let chat_id = group::create_group_chat(&alice, Some("standup"), Some("standup"), std::slice::from_ref(&bob_addr)).unwrap();
+    let chat_path = format!("/apps/msg/chats/{}", chat_id);
+
+    env::set_current_dir(root.join("bob")).unwrap();
+    let bob = ark::create_client_context().unwrap();
+    wait_for(|| {
+        join_chats(&bob);
+        ark::exists(&bob, &chat_path)
+    }, "bob to join the chat");
+    assert!(chat::is_chat_member(&bob, &chat_id).unwrap());
+
+    env::set_current_dir(root.join("alice")).unwrap();
+    group::remove_group_chat_member(&alice, &chat_id, &bob_addr).unwrap();
+
+    // The drop is not relayed to bob, so his mirror still has him in the
+    // chat — only alice's copy of it knows better.
+    env::set_current_dir(root.join("bob")).unwrap();
+    sync_msg(&bob);
+    assert!(has_member(&chat::get_chat_members(&bob, &chat_id).unwrap(), &bob_addr));
+    assert!(!chat::is_chat_member(&bob, &chat_id).unwrap());
+
+    // The owner cannot be dropped from their own chat.
+    env::set_current_dir(root.join("alice")).unwrap();
+    assert!(chat::is_chat_member(&alice, &chat_id).unwrap());
+}

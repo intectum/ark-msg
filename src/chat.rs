@@ -145,3 +145,26 @@ pub fn get_chat_members(ctx: &ark::Context, chat_id: &str) -> io::Result<Vec<Cha
 
     Ok(members)
 }
+
+/// Whether this account is still a member of a chat, asked of the chat's
+/// owner. Reaches their server, so this is not for the redraw path.
+///
+/// A removal is never relayed to the member it drops — their mirror keeps the
+/// membership it last saw — so the owner's copy is the only place it shows.
+/// A chat with no owner but this account cannot have dropped it.
+pub fn is_chat_member(ctx: &ark::Context, chat_id: &str) -> io::Result<bool> {
+    let path = get_chat_path(chat_id);
+
+    let owner = ark::read_metadata_attributes(ctx, &path)?.members.into_iter()
+        .find(|member| member.permission == ark::Permission::Owner
+            && member.address != ctx.identity.address
+            && !is_group_address(&member.address));
+    let Some(owner) = owner else { return Ok(true); };
+
+    match ark::head(ctx, &format!("{}{}", owner.address, path)) {
+        Ok(_) => Ok(true),
+        // The chat dir answers every member; only a dropped one is turned away.
+        Err(error) if matches!(error.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
